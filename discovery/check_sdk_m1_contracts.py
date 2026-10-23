@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import sdk_m1_contracts_conformance as gate
+from check_sdk_m2_audio_lifecycle import authority_rows, lifecycle_engine
 
 IDENTITY = dict(sourceCommit='a' * 40, sourceInputsSHA256='b' * 64, sourceDirty=False)
 CALL = '61B0C5C2-78DD-48B8-9C56-0C6A6D53B78A'
@@ -48,7 +49,7 @@ def fixture(build, capture):
             return row
         add('app.entry')
         add('launch', traceVersion=2, mode='sdk-m1-contracts', case=case, runtimeInjectionPresent=False,
-            executableSHA256=gate.digest(build / gate.BUILD_FILES[0]), simulatorOS='synthetic-iOS-27.0')
+            executableSHA256=gate.digest(build / gate.BUILD_FILES[0]), simulatorOS='27.0')
         add('contract.activation', active=True)
         if case in ('unhandled-accept', 'unhandled-fail'):
             add('contract.configuration', policy=case.removeprefix('unhandled-'), handlerAttached=False)
@@ -59,6 +60,26 @@ def fixture(build, capture):
                 add('contract.creationBegin', phase=phase)
                 add('contract.warning', phase=phase, count=count, message=gate.WARNING)
                 add('contract.creationEnd', phase=phase, warnings=count, identity=identity)
+        elif case == 'media-reentrancy':
+            add('contract.mediaReentrancy', authorizationCalls=1, sameOwner=True, warnings=0)
+        elif case == 'audio-lifecycle':
+            for row in authority_rows():
+                add(row['event'], **{key: value for key, value in row.items() if key != 'event'})
+        elif case == 'audio-routes':
+            add('routes.lckDelegate', active=True)
+            add('routes.authority', conversationID=CALL, authorized=True)
+            add('routes.command', id='speaker', succeeded=True)
+            snapshot = dict(revision=2, routes=[dict(id='input:mic', name='Microphone', type='MicrophoneBuiltIn'),
+                dict(id='speaker', name='Speaker', type='Speaker'),
+                dict(id='output:receiver', name='Actual receiver', type='Receiver')],
+                current=dict(id='output:receiver', name='Actual receiver', type='Receiver'))
+            fields = dict(snapshot=snapshot, inputs=[dict(uid='mic', name='Microphone', type='MicrophoneBuiltIn')],
+                          outputs=[dict(uid='receiver', name='Actual receiver', type='Receiver')])
+            add('routes.observed', phase='after', **fields)
+            add('routes.currentNoOp', available=True, unchanged=True)
+            add('routes.observed', phase='unchanged', **fields)
+            add('routes.lckDelegate', active=False)
+            add('routes.ended', conversationID=CALL, empty=True, authorized=False)
         elif case == 'duplicate-wrapper':
             payload_hash = 'd' * 64
             add('contract.duplicateSnapshot', revision=0, conversations=[])
@@ -140,6 +161,16 @@ def fixture(build, capture):
                 runtime('action.settled', at=28_501, actionID='native-cx-action', fulfilled=False, origin='application')
                 runtime('report.ended', at=30_002, callUUID=CALL, reason=1)
                 runtime('call.changed', at=30_003, uuid=CALL, connected=False, ended=True)
+        elif case == 'audio-lifecycle':
+            for row in lifecycle_engine():
+                runtime(row['event'], **{key: value for key, value in row.items() if key != 'event'})
+        elif case == 'audio-routes':
+            for kind, action, ended, audio in [('CXAnswerCallAction', 'join', False, 'activated'),
+                                                ('CXEndCallAction', 'end', True, 'deactivated')]:
+                runtime('transaction.delivered', kinds=[kind], actionIDs=[action])
+                runtime('action.settled', actionID=action, fulfilled=True)
+                runtime('call.changed', uuid=CALL, connected=False, ended=ended)
+                runtime('audio.' + audio)
         elif case == 'duplicate-wrapper':
             runtime('provider.apiKind', provider='provider-1', apiKind='livecommunicationkit', delegatePresent=True)
             for ordinal, source in ((1, 'foreground'), (2, 'pushKit')):
@@ -193,6 +224,57 @@ def later_system_end(rows, engine, settle=False):
 
 
 class Controls(unittest.TestCase):
+    def test_single_case_selection_is_explicit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build, capture = Path(temporary) / 'build', Path(temporary) / 'capture'
+            build.mkdir(); capture.mkdir(); fixture(build, capture)
+            with patch.object(gate, 'source_identity', return_value=IDENTITY):
+                result = gate.validate(build, capture, cases=('audio-lifecycle',))
+                self.assertEqual(set(result['cases']), {'audio-lifecycle'})
+                with self.assertRaises(gate.EvidenceError): gate.validate(build, capture, cases=())
+                with self.assertRaises(gate.EvidenceError): gate.validate(build, capture, cases=('absent',))
+                with self.assertRaises(gate.EvidenceError): gate.validate(build, capture, cases=('guard', 'guard'))
+
+    def test_route_observations_preserve_actual_output_and_reject_optimistic_state(self):
+        for mutate in (
+            lambda rows, engine: next(r for r in rows if r['event'] == 'routes.observed')['snapshot']['current'].update(id='input:mic'),
+            lambda rows, engine: next(r for r in rows if r['event'] == 'routes.observed')['snapshot']['current'].update(type='MicrophoneBuiltIn'),
+            lambda rows, engine: next(r for r in rows if r['event'] == 'routes.observed')['snapshot']['routes'].append(
+                dict(id='output:invented', name='Receiver', type='Receiver')),
+            lambda rows, engine: next(r for r in rows if r['event'] == 'routes.observed')['snapshot'].pop('current'),
+            lambda rows, engine: next(r for r in rows if r['event'] == 'routes.currentNoOp').update(unchanged=False),
+            lambda rows, engine: next(r for r in rows if r['event'] == 'routes.ended').update(authorized=True),
+            lambda rows, engine: next(r for r in engine if r['event'] == 'call.changed').update(uuid=ACTION),
+            lambda rows, engine: engine.remove(next(r for r in engine if r['event'] == 'audio.activated')),
+        ):
+            self.check('audio-routes', mutate)
+        def setter_error(rows, engine):
+            next(r for r in rows if r['event'] == 'routes.command').update(
+                succeeded=False, errorDomain='NSOSStatusErrorDomain', errorCode=-50)
+        self.check('audio-routes', setter_error, succeeds=True)
+        def no_output(rows, engine):
+            for row in rows:
+                if row['event'] == 'routes.observed':
+                    row.update(inputs=[], outputs=[], snapshot=dict(revision=1,
+                        routes=[dict(id='speaker', name='Speaker', type='Speaker')], current=None))
+                elif row['event'] == 'routes.currentNoOp': row['available'] = False
+        self.check('audio-routes', no_output, succeeds=True)
+
+    def test_lifecycle_capture_cannot_relabel_the_runtime_path(self):
+        self.check('audio-lifecycle', lambda rows, engine:
+            next(row for row in rows if row['event'] == 'launch').update(simulatorOS='26.5'))
+
+    def test_media_adapter_publication_and_reentrancy(self):
+        for field, value in [('authorizationCalls', 2), ('authorizationCalls', True),
+                             ('sameOwner', False), ('warnings', True), ('warnings', 1)]:
+            with self.subTest(field=field, value=value):
+                self.check('media-reentrancy', lambda rows, engine, field=field, value=value:
+                    next(r for r in rows if r['event'] == 'contract.mediaReentrancy').update({field: value}))
+        def extra_provider(rows, engine):
+            engine.append({**engine[-1], 'event': 'provider.created', 'provider': 'provider-2'})
+            reindex(engine)
+        self.check('media-reentrancy', extra_provider)
+
     def test_accept_cannot_race_the_platform_deadline(self):
         self.check('unhandled-accept', lambda rows, engine:
             next(row for row in engine if row['event'] == 'action.deadline').update(deadlineMS=WALL + 28_500))

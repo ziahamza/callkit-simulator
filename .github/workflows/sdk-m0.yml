@@ -7,13 +7,19 @@ on:
       - "Package.swift"
       - "VERSION"
       - "Sources/**"
+      - "Integrations/**"
+      - "Tests/**"
+      - "docs/research/callkit-simulator-probe/audio-session-lifecycle/2026-10-22-iphone13-ios27/device-trace.jsonl"
+      - "docs/research/callkit-simulator-probe/audio-session-lifecycle/2026-10-22-iphone13-ios27-noio/device-trace.jsonl"
       - "Expo/**"
+      - "ExpoMedia/**"
       - "example/**"
       - "package.json"
       - "package-lock.json"
       - "tsconfig.json"
       - "expo-module.config.json"
       - "IosVoipSDK.podspec"
+      - "Tools/cksim-notify.c"
       - "discovery/**"
       - "Tools/**"
       - "scripts/build-runtime.sh"
@@ -24,13 +30,19 @@ on:
       - "Package.swift"
       - "VERSION"
       - "Sources/**"
+      - "Integrations/**"
+      - "Tests/**"
+      - "docs/research/callkit-simulator-probe/audio-session-lifecycle/2026-10-22-iphone13-ios27/device-trace.jsonl"
+      - "docs/research/callkit-simulator-probe/audio-session-lifecycle/2026-10-22-iphone13-ios27-noio/device-trace.jsonl"
       - "Expo/**"
+      - "ExpoMedia/**"
       - "example/**"
       - "package.json"
       - "package-lock.json"
       - "tsconfig.json"
       - "expo-module.config.json"
       - "IosVoipSDK.podspec"
+      - "Tools/cksim-notify.c"
       - "discovery/**"
       - "Tools/**"
       - "scripts/build-runtime.sh"
@@ -46,8 +58,67 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  expo-livekit-native:
+    name: Pinned Expo LiveKit local-demand engine (iOS 27.1)
+    runs-on: xcode-27
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: "1"
+      EXPO_NO_TELEMETRY: "1"
+      SDK_EXAMPLE_MEDIA_ADAPTER: livekit
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: sudo xcode-select -s /Applications/Xcode_27.1.app
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "24.22.1"
+          package-manager-cache: false
+      - name: Check acceptance controls and build the pinned selected consumer
+        run: |
+          set -euo pipefail
+          python3 discovery/check_expo_livekit.py
+          python3 discovery/check_inherited_launcher_group.py
+          python3 Tests/ExpoMedia/check_standard_backend.py
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+          npm run typecheck
+          npm exec --workspace ios-voip-sdk-example -- expo prebuild --platform ios --no-install
+          (cd example/ios && pod install)
+          python3 discovery/build_expo_livekit.py "$RUNNER_TEMP/expo-livekit-build"
+      - name: Inspect the selected pod-built Release device app
+        run: >-
+          python3 discovery/build_sdk_device_release.py "$RUNNER_TEMP/expo-livekit-device"
+          --derived-data "$RUNNER_TEMP/expo-livekit-build/DerivedData" --livekit
+      - name: Require genuine engine join, hold, resume and stale-activation cleanup
+        run: >-
+          python3 discovery/run_expo_livekit.py "$RUNNER_TEMP/expo-livekit-build"
+          "$RUNNER_TEMP/expo-livekit-native"
+      - name: Preserve native results and selected build inputs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: expo-livekit-ios-27.1
+          path: |
+            ${{ runner.temp }}/expo-livekit-native
+            ${{ runner.temp }}/expo-livekit-build/*.json
+            ${{ runner.temp }}/expo-livekit-build/*.log
+            ${{ runner.temp }}/expo-livekit-build/Podfile.lock
+            ${{ runner.temp }}/expo-livekit-build/example.app
+            ${{ runner.temp }}/expo-livekit-build/cksim-notify
+            ${{ runner.temp }}/expo-livekit-device/*.json
+            ${{ runner.temp }}/expo-livekit-device/*.log
+          if-no-files-found: error
+          retention-days: 7
+      - name: Remove this job's native build cache
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/expo-livekit-build/DerivedData"
   plain-simulator:
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 60
     defaults:
       run:
@@ -57,12 +128,13 @@ jobs:
       EXPO_NO_TELEMETRY: "1"
       SDK_M1_ACCEPTANCE: "1"
       SDK_SYSTEM_ACCEPTANCE: "1"
+      SDK_M0_RUNTIME: com.apple.CoreSimulator.SimRuntime.iOS-27-0
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Select the compiler and simulator host
-        run: sudo xcode-select -s /Applications/Xcode_26.6.app
+        run: sudo xcode-select -s /Applications/Xcode_27.1.app
       - name: Check offline evidence controls and shell syntax
         run: |
           set -euo pipefail
@@ -101,14 +173,28 @@ jobs:
           bash Tests/VoIPSDK/run_incoming_intake.sh | tee "$SDK_M0_BUILD_LOGS/incoming-intake-controls.log"
           bash Tests/VoIPSDK/run_report_contracts.sh | tee "$SDK_M0_BUILD_LOGS/report-contract-controls.log"
           python3 discovery/check_push_report_capture.py 2>&1 | tee "$SDK_M0_BUILD_LOGS/push-entry-capture-controls.log"
+          python3 discovery/check_console_stop.py --output "$SDK_M0_BUILD_LOGS/console-stop" | tee "$SDK_M0_BUILD_LOGS/console-stop-controls.json"
           python3 discovery/check_device_release.py 2>&1 | tee "$SDK_M0_BUILD_LOGS/device-release-controls.log"
           python3 discovery/check_lck_provider_policy.py | tee "$SDK_M0_BUILD_LOGS/lck-policy-controls.json"
           bash Tests/VoIPSDK/run.sh | tee "$SDK_M0_BUILD_LOGS/core-controls.log"
+          bash Tests/AudioSessionQueue/run.sh | tee "$SDK_M0_BUILD_LOGS/audio-queue-controls.log"
+          bash Tests/AudioCore/run.sh | tee "$SDK_M0_BUILD_LOGS/audio-watchdog-controls.log"
+          python3 Tests/AudioLifecycle/check_audio_lifecycle.py | tee "$SDK_M0_BUILD_LOGS/audio-lifecycle-controls.log"
+          python3 Tests/AudioLifecycle/check_audio_fixtures.py | tee "$SDK_M0_BUILD_LOGS/audio-raw-fixtures.log"
+          python3 Tests/AudioRoutes/run.py | tee "$SDK_M0_BUILD_LOGS/audio-route-controls.log"
+          python3 discovery/check_expo_media.py | tee "$SDK_M0_BUILD_LOGS/webrtc-facade-controls.log"
+          python3 discovery/check_expo_media_config.py | tee "$SDK_M0_BUILD_LOGS/media-selection-controls.log"
+          python3 Tests/ExpoMedia/check_standard_backend.py | tee "$SDK_M0_BUILD_LOGS/standard-backend-gate-controls.log"
+          bash Tests/AudioCore/run_livekit.sh | tee "$SDK_M0_BUILD_LOGS/swift-livekit-adapter-controls.log"
+          python3 discovery/check_audio_contract_cleanup.py | tee "$SDK_M0_BUILD_LOGS/audio-contract-cleanup-controls.log"
+          python3 discovery/check_sdk_m2_audio_lifecycle.py | tee "$SDK_M0_BUILD_LOGS/audio-lifecycle-capture-controls.log"
           bash Tests/VoIPSDK/run_push.sh | tee "$SDK_M0_BUILD_LOGS/push-controls.log"
           bash Tests/VoIPSDK/run_projection.sh | tee "$SDK_M0_BUILD_LOGS/projection-controls.log"
           bash Tests/VoIPSDK/run_mute_echo.sh | tee "$SDK_M0_BUILD_LOGS/mute-echo-controls.json"
           bash Tests/ProbeTraceWriter/run.sh | tee "$SDK_M0_BUILD_LOGS/probe-writer-controls.json"
-          bash -n discovery/build_sdk_bootstrap.sh discovery/build_sdk_device_probe.sh discovery/build_sdk_m1_contracts.sh discovery/build_push_report_entry.sh discovery/run_sdk_m0.sh
+          for script in discovery/build_sdk_bootstrap.sh discovery/build_sdk_device_probe.sh discovery/build_sdk_m1_contracts.sh discovery/build_push_report_entry.sh discovery/run_sdk_m0.sh discovery/run_audio_lifecycle_legacy.sh; do
+            bash -n "$script"
+          done
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "24.22.1"
@@ -137,6 +223,7 @@ jobs:
           npm run build 2>&1 | tee "$SDK_M0_BUILD_LOGS/typescript-build.log"
           npm run typecheck 2>&1 | tee "$SDK_M0_BUILD_LOGS/typescript-typecheck.log"
           node --test Expo/tests/m1-runtime.test.cjs 2>&1 | tee "$SDK_M0_BUILD_LOGS/typescript-runtime-controls.log"
+          node --test Tests/ExpoMedia/selection.test.cjs 2>&1 | tee "$SDK_M0_BUILD_LOGS/media-plugin-selection-controls.log"
           node discovery/check_expo_plugin.cjs 2>&1 | tee "$SDK_M0_BUILD_LOGS/plugin-controls.json"
       - name: Generate the iOS example and install its pods
         run: |
@@ -229,16 +316,147 @@ jobs:
               fi
             done
           done
+      - name: Build the pinned standard WebRTC example for Release iphoneos
+        env:
+          SDK_EXAMPLE_MEDIA_ADAPTER: webrtc
+        run: |
+          set -euo pipefail
+          npm exec --workspace ios-voip-sdk-example -- expo prebuild --platform ios --no-install 2>&1 | tee "$SDK_M0_BUILD_LOGS/webrtc-prebuild.log"
+          (cd example/ios && pod install) 2>&1 | tee "$SDK_M0_BUILD_LOGS/webrtc-pod-install.log"
+          python3 discovery/build_sdk_device_release.py "$SDK_M0_BUILD_ROOT/pod-standard-webrtc" --standard-webrtc \
+            --derived-data "$SDK_M0_BUILD_ROOT/pod-device/DerivedData" > "$SDK_M0_BUILD_LOGS/webrtc-device-inspection.log" 2>&1
       - name: Preserve M0 evidence and build logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: sdk-m0-macos-26-xcode-26.6
+          name: sdk-m0-xcode-27.1
           path: |
             ${{ runner.temp }}/sdk-m0
             ${{ runner.temp }}/sdk-m0-build-logs
+            ${{ runner.temp }}/sdk-m0-build/pod-standard-webrtc/*.json
+            ${{ runner.temp }}/sdk-m0-build/pod-standard-webrtc/*.log
           if-no-files-found: error
           retention-days: 30
+      - name: Hand off the SDK 27 contract app for legacy audio and Duo routes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sdk-27-m1-contract-app
+          path: |
+            ${{ env.SDK_M1_CONTRACT_BUILD }}/SDKM1Contracts.app
+            ${{ env.SDK_M1_CONTRACT_BUILD }}/build-info.json
+            ${{ env.SDK_M1_CONTRACT_BUILD }}/source-before.json
+            ${{ env.SDK_M1_CONTRACT_BUILD }}/source-after.json
+            ${{ env.SDK_M1_CONTRACT_BUILD }}/build.log
+          if-no-files-found: error
+          retention-days: 7
       - name: Remove native build outputs
         if: always()
         run: rm -rf "$RUNNER_TEMP/sdk-m0-build"
+
+  legacy-audio-lifecycle:
+    needs: plain-simulator
+    runs-on: macos-26
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Select the older runtime host
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sdk-27-m1-contract-app
+          path: ${{ runner.temp }}/sdk-27-contract-build
+      - name: Restore the app executable mode after artifact download
+        run: chmod +x "$RUNNER_TEMP/sdk-27-contract-build/SDKM1Contracts.app/SDKM1Contracts"
+      - name: Check the older SDK decoder branch
+        run: python3 Tests/AudioLifecycle/check_audio_lifecycle.py
+      - name: Run only the audio lifecycle contract on iOS 26.5
+        env:
+          SDK_M1_CONTRACT_BUILD: ${{ runner.temp }}/sdk-27-contract-build
+          OUT: ${{ runner.temp }}/audio-lifecycle-legacy
+        run: bash discovery/run_audio_lifecycle_legacy.sh
+      - name: Preserve the scoped legacy capture
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: audio-lifecycle-ios-26.5-sdk-27
+          path: ${{ runner.temp }}/audio-lifecycle-legacy
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove the downloaded app
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/sdk-27-contract-build"
+
+  duo-audio-routes:
+    needs: plain-simulator
+    runs-on: xcode-27
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Select Xcode 27.1 for the iPhone Duo runtime
+        run: sudo xcode-select -s /Applications/Xcode_27.1.app
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sdk-27-m1-contract-app
+          path: ${{ runner.temp }}/sdk-27-contract-build
+      - name: Restore the app executable mode after artifact download
+        run: chmod +x "$RUNNER_TEMP/sdk-27-contract-build/SDKM1Contracts.app/SDKM1Contracts"
+      - name: Run only the route contract on the exact iPhone Duo and iOS 27.1 pair
+        env:
+          SDK_M1_CONTRACT_BUILD: ${{ runner.temp }}/sdk-27-contract-build
+          OUT: ${{ runner.temp }}/audio-routes-duo
+        run: bash discovery/run_audio_lifecycle_legacy.sh duo-routes
+      - name: Preserve the scoped Duo route capture
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: audio-routes-iphone-duo-ios-27.1
+          path: ${{ runner.temp }}/audio-routes-duo
+          if-no-files-found: error
+          retention-days: 7
+      - name: Remove the downloaded app
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/sdk-27-contract-build"
+
+  swift-livekit-native:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    env:
+      SDK_SWIFT_LIVEKIT_RUNTIME: com.apple.CoreSimulator.SimRuntime.iOS-27-0
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Select Xcode 27.1
+        run: sudo xcode-select -s /Applications/Xcode_27.1.app
+      - name: Check the focused engine acceptance gates
+        run: python3 discovery/check_swift_livekit.py
+      - name: Build a fresh pinned Swift consumer and notifier
+        run: python3 discovery/build_swift_livekit_contract.py "$RUNNER_TEMP/swift-livekit-build"
+      - name: Measure both real Swift engine modes on one owned simulator
+        run: python3 discovery/run_swift_livekit.py "$RUNNER_TEMP/swift-livekit-build" "$RUNNER_TEMP/swift-livekit-native"
+      - name: Preserve the source, pinned build and native captures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: swift-livekit-native-xcode-27.1
+          path: |
+            ${{ runner.temp }}/swift-livekit-build
+            ${{ runner.temp }}/swift-livekit-native
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove the owned build products
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/swift-livekit-build"

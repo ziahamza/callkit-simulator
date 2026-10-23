@@ -14,8 +14,10 @@
       [
         "ios-voip-sdk",
         {
+          "mediaAdapter": "none",
           "unhandledAction": "fail",
           "simulatorSupport": true,
+          "defaultCallingApp": true,
           "includesCallsInRecents": false
         }
       ],

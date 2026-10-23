@@ -10,13 +10,14 @@ import shutil
 import subprocess
 import uuid
 
-from check_push_report_entry import native_source_identity, qualify_journal, qualify_negative_journal
+from check_push_report_entry import (native_source_identity, qualify_journal, qualify_negative_journal,
+                                     qualify_deadline_journal, push_deadline_references)
 from push_main_stall_conformance import qualify_main_stall_journal
 from run_scenario import run
 from summarize import successful_stop
 
 BUNDLE = 'dev.iosvoipsdk.pushentry'
-CASES = ('sdk-required', 'sdk-duplicate', 'missing', 'deferred', 'optional', 'sdk-main-stall')
+CASES = ('sdk-required', 'sdk-duplicate', 'missing', 'deferred', 'optional', 'sdk-main-stall', 'late-report')
 CLASSIFICATION = 'simulator in-app PushKit injections and direct SDK callback-body main-stall fixture; not cold launch or APNs'
 PRODUCTS = {'PushEntry.app/PushEntry', 'PushEntry.app/Info.plist',
             'PushEntry.app/IosVoipSDKRuntime.bundle/ios-27.0.json'}
@@ -70,7 +71,8 @@ def validate(out):
     require(installed == build['files'], 'installed executable, Info or profile differs from build')
     profile = json.loads((out / 'build/PushEntry.app/IosVoipSDKRuntime.bundle/ios-27.0.json').read_text())
     require(profile.get('id') == 'ios-27.0' and type(profile.get('schemaVersion')) is int and
-            profile['schemaVersion'] == 1, 'incorrect runtime profile')
+            profile['schemaVersion'] == 1 and profile == json.loads((Path(__file__).resolve().parents[1] /
+                'Sources/Engine/Resources/ios-27.0.json').read_text()), 'incorrect runtime profile')
     results = []
     for mode in CASES:
         receipt = json.loads((out / (mode + '.receipt.json')).read_text())
@@ -79,13 +81,22 @@ def validate(out):
         require(type(pid) is int and pid > 0 and str(uuid.UUID(run_id)) == run_id,
                 'invalid native process or run identity')
         require(type(receipt.get('schemaVersion')) is int and receipt['schemaVersion'] == 2 and
-                receipt.get('success') is True and receipt.get('completed') is True and
-                receipt.get('terminationMethod') == 'console-launcher-signal' and successful_stop(receipt) and
-                not receipt.get('error') and
+                receipt.get('success') is True and not receipt.get('error') and
                 receipt.get('appPID') == pid and receipt.get('launcherAppPID') == pid and
                 receipt.get('runID') == run_id and receipt.get('simulatorID') == sim and
                 receipt.get('bundleID') == BUNDLE and receipt.get('scenario') == 'sdk-a1-' + mode,
                 'unbound or unsuccessful supervisor')
+        if mode == 'late-report':
+            require(receipt.get('expectedAppExit') is True and receipt.get('completed') is False and
+                    receipt.get('terminationMethod') == 'natural-app-exit' and receipt.get('appAbsentBeforeCleanup') is True and
+                    receipt.get('appAbsenceMethod') == 'signal-zero' and type(receipt.get('launchExitCode')) is int and
+                    receipt['launchExitCode'] in (0, 78) and type(receipt.get('launchExitCodeBeforeCleanup')) is int and
+                    receipt['launchExitCodeBeforeCleanup'] == receipt['launchExitCode'] and
+                    not any(key in receipt for key in ('cleanupExitCode', 'cleanupError', 'terminateExitCode', 'terminationSignal', 'terminationSignalDelivered')) and
+                    not successful_stop(receipt), 'expiry was not a natural, pre-cleanup app exit')
+        else:
+            require(receipt.get('completed') is True and receipt.get('terminationMethod') == 'console-launcher-signal' and
+                    successful_stop(receipt), 'ordinary case lost successful owned stop')
         require(receipt.get('traceSHA256') == digest(out / (mode + '.log')) and
                 receipt.get('journalSHA256') == digest(out / (mode + '.runtime.jsonl')),
                 'unbound console or native journal')
@@ -108,8 +119,11 @@ def validate(out):
         require(probes[:2] == [one('app.entry'), launch], 'missing native startup evidence')
         require(launch.get('case') == mode and launch.get('executableSHA256') ==
                 build['files']['PushEntry.app/PushEntry'], 'wrong launched native product')
-        require(one('entry.capture').get('boundariesObserved') is True and probes[-1] == one('done'),
-                'missing terminal native boundary observation')
+        if mode == 'late-report':
+            require(not any(row['event'] in ('entry.capture', 'done') for row in probes), 'expiry fixture reached normal completion')
+        else:
+            require(one('entry.capture').get('boundariesObserved') is True and probes[-1] == one('done'),
+                    'missing terminal native boundary observation')
         session = json.loads((out / (mode + '.session.json')).read_text())
         require(type(session.get('pid')) is int and session['pid'] == pid and session.get('runID') == run_id and
                 session.get('bundleID') == BUNDLE and type(session.get('schemaVersion')) is int and
@@ -118,7 +132,9 @@ def validate(out):
                 session.get('notification') == 'dev.callkitsim.control.' + str(pid), 'unbound runtime session')
         rows = [json.loads(line) for line in (out / (mode + '.runtime.jsonl')).read_text().splitlines()]
         require(rows and all(row.get('profile') == profile['id'] for row in rows), 'mixed native runtime profile')
-        if mode == 'sdk-main-stall':
+        if mode == 'late-report':
+            results.append(qualify_deadline_journal(rows, run_id, pid, profile))
+        elif mode == 'sdk-main-stall':
             results.append(qualify_main_stall_journal(rows, probes, run_id, pid))
         else:
             gate = qualify_negative_journal if mode in ('missing', 'deferred') else qualify_journal
@@ -127,7 +143,7 @@ def validate(out):
             len({item['runID'] for item in manifest['cases'].values()}) == len(CASES),
             'native cases reused a process or run')
     return dict(success=True, classification=manifest['classification'], source=manifest['source'],
-                simulatorID=sim, cases=results,
+                simulatorID=sim, deviceReferences=push_deadline_references(profile), cases=results,
                 cleanupResponsibility='The enclosing M0 runner must record owned simulator deletion.')
 
 
@@ -157,7 +173,8 @@ def capture(build, out, sim):
                   'SIMCTL_CHILD_CKSIM_RUN_ID=' + run_id, 'SIMCTL_CHILD_SDK_PUSH_ENTRY_CASE=' + mode,
                   'xcrun', 'simctl', 'launch', '--console', sim, BUNDLE]
         status = run(launch, ['xcrun', 'simctl', 'terminate', sim, BUNDLE], log, receipt, 30,
-                     dict(runID=run_id, simulatorID=sim, scenario='sdk-a1-' + mode, bundleID=BUNDLE), True)
+                     dict(runID=run_id, simulatorID=sim, scenario='sdk-a1-' + mode, bundleID=BUNDLE), True,
+                     expected_app_exit=(mode == 'late-report'))
         require(status == 0, mode + ' supervisor failed; retained receipt explains failure')
         supervisor = json.loads(receipt.read_text())
         container = Path(simctl(out, mode + '-container', 'get_app_container', sim, BUNDLE, 'data'))

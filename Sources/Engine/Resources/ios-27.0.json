@@ -21,7 +21,7 @@
     "livecommunicationkit": "complete"
   },
   "fulfilledPostEndUnmuteEvidence": {
-    "callkit": "Measured fulfilled post-end unmute still times out in 5.0–5.9 s.",
+    "callkit": "Measured fulfilled post-end unmute still times out in 5.0\u20135.9 s.",
     "livecommunicationkit": "Measured no timeout through 5.542 s after fulfilled post-end unmute; terminal settlement follows public fulfill/complete semantics, not a measured infinite observation."
   },
   "lckActionDeadlineSeconds": 30,
@@ -45,6 +45,15 @@
         "sha256": "23ab443e1fd8623140e95cc7d34157d5fd8aa7d13b6321f90e1812825f65a042",
         "samples": 4
       }
+    }
+  },
+  "pushReportDeadlineSeconds": 4.4,
+  "pushReportDeadlineEvidence": {
+    "measured": "Approximate 4.4 s termination and PKPushRegistry crash attribution from the device pass writeup; raw late-5s trace ends alive at4.200 s without a kill event.",
+    "reference": "docs/research/callkit-simulator-probe/livecommunicationkit/push/README.md",
+    "captures": {
+      "docs/research/callkit-simulator-probe/livecommunicationkit/push/2026-10-23-iphone13-ios27-late-report-3s.jsonl": "1ed65280b43ebe27ab8b52535bb7b1df15b301e4eb9ab6d690cc9c8690ef36cf",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/push/2026-10-23-iphone13-ios27-late-report-5s.jsonl": "65aa587060ac3a2e5a898d97675e0c902dba70d7c8bf0b2d7dad0ab8ad29da2c"
     }
   }
 }

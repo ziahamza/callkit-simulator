@@ -1,8 +1,13 @@
 import { useEffect, useRef, useSyncExternalStore } from 'react';
 
-import { EMPTY_CONVERSATIONS } from './internal/client';
+import { EMPTY_AUDIO_ROUTES, EMPTY_CONVERSATIONS } from './internal/client';
 import { getRuntime } from './internal/native';
-import type { Conversation, ConversationEventMap, PushToken } from './types';
+import type {
+  AudioRoutes,
+  Conversation,
+  ConversationEventMap,
+  PushToken,
+} from './types';
 
 /** System-maintained state. Snapshots are immutable and stable until changed. */
 export function useConversations(): readonly Conversation[] {
@@ -27,6 +32,17 @@ export function usePushToken(): PushToken | null {
     runtime.pushToken.subscribe,
     runtime.pushToken.getSnapshot,
     () => null,
+  );
+}
+
+/** OS-reported inputs/current output plus the explicit speaker override target. */
+export function useAudioRoutes(): AudioRoutes {
+  const runtime = getRuntime();
+  useEffect(() => runtime.startAudioRoutes(), [runtime]);
+  return useSyncExternalStore(
+    runtime.audioRoutes.subscribe,
+    runtime.audioRoutes.getSnapshot,
+    () => EMPTY_AUDIO_ROUTES,
   );
 }
 

@@ -9,15 +9,18 @@ import subprocess
 import uuid
 
 from device_oracles import check_deadline, deadline_bands
+from sdk_m2_audio_lifecycle import validate_authority, validate_lifecycle
 from sdk_m0_conformance import bound_rows, digest
 from summarize import EvidenceError, load, one, require
 
 ROOT = Path(__file__).resolve().parent.parent
 BUNDLE = 'dev.iosvoipsdk.m1contracts'
-CASES = ('guard', 'unhandled-accept', 'unhandled-fail', 'duplicate-wrapper')
+CASES = ('guard', 'unhandled-accept', 'unhandled-fail', 'duplicate-wrapper', 'media-reentrancy', 'audio-lifecycle', 'audio-routes')
 OWN_FILES = ('discovery/probe/sdk_m1_contracts.swift', 'discovery/build_sdk_m1_contracts.sh',
+             'discovery/run_audio_lifecycle_legacy.sh',
              'discovery/sdk_m1_contracts_conformance.py', 'discovery/check_sdk_m1_contracts.py',
              'discovery/probe/Info.plist', 'discovery/run_scenario.py', 'discovery/sdk_m0_conformance.py',
+             'discovery/sdk_m2_audio_lifecycle.py', 'discovery/check_sdk_m2_audio_lifecycle.py',
              'discovery/sdk_bootstrap_conformance.py', 'discovery/summarize.py', 'discovery/device_oracles.py', 'VERSION')
 REFERENCES = tuple('docs/research/callkit-simulator-probe/livecommunicationkit/2026-10-21-iphone13-ios27-lck-' + case + '.jsonl'
                    for case in ('basic', 'cx-after', 'lck-after', 'two-managers'))
@@ -49,6 +52,86 @@ def record_build(directory, target):
                 xcodeVersion=subprocess.check_output(['xcodebuild', '-version'], text=True).strip(),
                 sdkVersion=subprocess.check_output(['xcrun', '--sdk', 'iphonesimulator', '--show-sdk-version'], text=True).strip())
     (directory / 'build-info.json').write_text(json.dumps(info, indent=2) + '\n')
+
+
+def reentrancy_contract(rows, engine):
+    owner = one(rows, 'contract.owner')
+    result = one(rows, 'contract.mediaReentrancy')
+    require(isinstance(owner.get('identity'), str) and owner['identity'] and
+            owner['identity'] == owner.get('sharedIdentity') and owner.get('warnings') == 0,
+            'reentrancy: process owner differs')
+    require(type(result.get('authorizationCalls')) is int and result['authorizationCalls'] == 1 and
+            result.get('sameOwner') is True and type(result.get('warnings')) is int and result['warnings'] == 0,
+            'reentrancy: singleton/adapter callback contract failed')
+    require(len([r for r in engine if r['event'] == 'provider.created']) == 1 and
+            not any(r['event'] in ('transaction.delivered', 'call.changed') for r in engine),
+            'reentrancy: unexpected provider or call activity')
+    return dict(success=True, owners=1, authorizationCalls=1)
+
+
+def routes_contract(rows, engine):
+    owner = one(rows, 'contract.owner')
+    require(isinstance(owner.get('identity'), str) and owner['identity'] and
+            owner['identity'] == owner.get('sharedIdentity') and owner.get('warnings') == 0,
+            'routes: process owner differs')
+    require(len([r for r in engine if r['event'] == 'provider.created']) == 1,
+            'routes: expected one provider')
+    snapshots = []
+    for phase in ('after', 'unchanged'):
+        row = one(rows, 'routes.observed', phase=phase)
+        inputs, outputs, snapshot = row.get('inputs'), row.get('outputs'), row.get('snapshot')
+        require(isinstance(inputs, list) and isinstance(outputs, list) and isinstance(snapshot, dict),
+                'routes: missing OS observations or snapshot')
+        require(all(isinstance(port, dict) and set(port) == {'uid', 'name', 'type'} and
+                    all(isinstance(port[key], str) and port[key] for key in port) for port in inputs + outputs),
+                'routes: invalid OS port')
+        expected = []
+        for port in inputs:
+            value = dict(id='input:' + port['uid'], name=port['name'], type=port['type'])
+            if not any(route['id'] == value['id'] for route in expected): expected.append(value)
+        expected.append(dict(id='speaker', name='Speaker', type='Speaker'))
+        current = None
+        if outputs:
+            current = dict(id='output:' + outputs[0]['uid'], name=outputs[0]['name'], type=outputs[0]['type'])
+            expected.append(current)
+        require(type(snapshot.get('revision')) is int and snapshot['revision'] > 0 and
+                snapshot.get('routes') == expected and 'current' in snapshot and snapshot['current'] == current,
+                'routes: public snapshot differs from actual OS input/current output identities')
+        snapshots.append(snapshot)
+    command, noop = one(rows, 'routes.command'), one(rows, 'routes.currentNoOp')
+    require(command.get('id') == 'speaker' and type(command.get('succeeded')) is bool,
+            'routes: missing speaker command outcome')
+    if not command['succeeded']:
+        require(isinstance(command.get('errorDomain'), str) and command['errorDomain'] and
+                type(command.get('errorCode')) is int, 'routes: missing native command error')
+    require(noop.get('available') is (snapshots[0]['current'] is not None) and noop.get('unchanged') is True and
+            snapshots[1] == snapshots[0], 'routes: already-current selection changed the observed snapshot')
+    authority, ended = one(rows, 'routes.authority'), one(rows, 'routes.ended')
+    require(isinstance(authority.get('conversationID'), str) and
+            str(uuid.UUID(authority['conversationID'])).upper() == authority['conversationID'] and
+            authority.get('authorized') is True and ended.get('conversationID') == authority['conversationID'] and
+            ended.get('empty') is True and ended.get('authorized') is False,
+            'routes: real LCK call authority/cleanup differs')
+    ordered = [owner, authority, command,
+               one(rows, 'routes.observed', phase='after'), noop,
+               one(rows, 'routes.observed', phase='unchanged'), ended]
+    require([rows.index(row) for row in ordered] == sorted(rows.index(row) for row in ordered),
+            'routes: observation/command/cleanup order differs')
+    call = authority['conversationID']
+    changes = [r for r in engine if r['event'] == 'call.changed']
+    transactions = [r for r in engine if r['event'] == 'transaction.delivered']
+    settled = [r for r in engine if r['event'] == 'action.settled']
+    require(changes and all(r.get('uuid') == call for r in changes) and changes[-1].get('ended') is True and
+            [r.get('kinds') for r in transactions] == [['CXAnswerCallAction'], ['CXEndCallAction']] and
+            all(isinstance(r.get('actionIDs'), list) and len(r['actionIDs']) == 1 for r in transactions) and
+            [r.get('actionID') for r in settled] == [r['actionIDs'][0] for r in transactions] and
+            all(r.get('fulfilled') is True for r in settled) and
+            [r['event'] for r in engine if r['event'] in ('audio.activated', 'audio.deactivated')] ==
+            ['audio.activated', 'audio.deactivated'] and
+            [r.get('active') for r in rows if r['event'] == 'routes.lckDelegate'] == [True, False],
+            'routes: same-call native join/end/audio ledger differs')
+    return dict(success=True, speakerCommandSucceeded=command['succeeded'], observedSnapshots=2,
+                classification='native OS route observations; no hardware or fold claim')
 
 
 def guard_contract(rows, engine):
@@ -449,9 +532,10 @@ def validate_build(build, source_root=ROOT):
     return info, identity
 
 
-def validate(build, capture, source_root=ROOT, parent_manifest=None):
+def validate(build, capture, source_root=ROOT, parent_manifest=None, cases=CASES):
     info, identity = validate_build(build, source_root)
-    first = json.loads((capture / 'sdk-m1-contract-guard.receipt.json').read_text())
+    require(cases and len(set(cases)) == len(cases) and all(case in CASES for case in cases), 'unknown or duplicate contract case')
+    first = json.loads((capture / ('sdk-m1-contract-' + cases[0] + '.receipt.json')).read_text())
     manifest = {k: first.get(k) for k in ('runID', 'simulatorID')}
     require(all(isinstance(v, str) and v for v in manifest.values()), 'missing run/simulator identity')
     if parent_manifest is not None:
@@ -461,7 +545,7 @@ def validate(build, capture, source_root=ROOT, parent_manifest=None):
     results = {}
     execution_os = None
     processes = set()
-    for case in CASES:
+    for case in cases:
         name = 'sdk-m1-contract-' + case
         rows, receipt = bound_rows(capture, name, manifest, BUNDLE)
         require(receipt['appPID'] not in processes, 'contracts reused a process')
@@ -492,6 +576,12 @@ def validate(build, capture, source_root=ROOT, parent_manifest=None):
         if case == 'guard': results[case] = guard_contract(rows, engine)
         elif case == 'unhandled-accept': results[case] = accept_contract(rows, engine, source_root)
         elif case == 'unhandled-fail': results[case] = fail_contract(rows, engine, source_root)
+        elif case == 'audio-lifecycle':
+            require(re.fullmatch(r'[0-9]+(?:\.[0-9]+){1,2}', execution_os), 'lifecycle: invalid execution OS')
+            modern = int(execution_os.split('.')[0]) >= 27
+            results[case] = validate_authority(rows, engine) if modern else validate_lifecycle(rows, engine, 'legacy')
+        elif case == 'audio-routes': results[case] = routes_contract(rows, engine)
+        elif case == 'media-reentrancy': results[case] = reentrancy_contract(rows, engine)
         else: results[case] = duplicate_contract(rows, engine)
         require(one(rows, 'contract.result').get('success') is True and not any(r['event'] == 'contract.error' for r in rows), 'native contract reported failure')
     return dict(success=True, classification='measured native contracts', cases=results,
@@ -502,8 +592,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('build', type=Path); parser.add_argument('capture', type=Path)
     parser.add_argument('--parent-manifest', type=Path)
+    parser.add_argument('--case', choices=CASES, help='Run one contract; the default requires the complete suite')
     args = parser.parse_args()
-    try: result = validate(args.build, args.capture, parent_manifest=args.parent_manifest)
+    try: result = validate(args.build, args.capture, parent_manifest=args.parent_manifest,
+                           cases=(args.case,) if args.case else CASES)
     except (EvidenceError, OSError, ValueError, KeyError, TypeError, StopIteration, subprocess.SubprocessError) as error:
         result = dict(success=False, error=str(error))
     print(json.dumps(result, indent=2))

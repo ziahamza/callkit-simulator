@@ -1,0 +1,86 @@
+name: SDK M3 direct simulator delivery
+
+on:
+  pull_request:
+    paths: ["Sources/**", "Expo/**", "ExpoMedia/**", "example/**", "Tests/**", "discovery/**", "package*.json", "IosVoipSDK.podspec", ".github/workflows/sdk-m3.yml"]
+  push:
+    branches: [main]
+    paths: ["Sources/**", "Expo/**", "ExpoMedia/**", "example/**", "Tests/**", "discovery/**", "package*.json", "IosVoipSDK.podspec", ".github/workflows/sdk-m3.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-m3-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  direct-delivery:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: "1"
+      EXPO_NO_TELEMETRY: "1"
+      SDK_EXAMPLE_MEDIA_ADAPTER: none
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Select Xcode and assign owned output paths
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_27.1.app
+          printf 'SDK_M3_BUILD=%s/sdk-m3-build\nSDK_M3_OUT=%s/sdk-m3-native\nSDK_M3_LOGS=%s/sdk-m3-logs\n' "$RUNNER_TEMP" "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          mkdir "$RUNNER_TEMP/sdk-m3-logs"
+          { xcodebuild -version; xcrun --sdk iphonesimulator --show-sdk-version; } > "$RUNNER_TEMP/sdk-m3-logs/environment.log" 2>&1
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "24.22.1"
+          package-manager-cache: false
+      - name: Verify host evidence and public APIs
+        run: |
+          set -euo pipefail
+          python3 discovery/check_sdk_m3_direct.py 2>&1 | tee "$SDK_M3_LOGS/m3-direct-controls.log"
+          bash Tests/DialRequests/run.sh 2>&1 | tee "$SDK_M3_LOGS/dial-controls.log"
+          python3 discovery/check_expo_bridge.py 2>&1 | tee "$SDK_M3_LOGS/bridge-controls.log"
+          bash -n discovery/build_sdk_m3.sh
+          npm ci --ignore-scripts --no-audit --no-fund 2>&1 | tee "$SDK_M3_LOGS/npm-ci.log"
+          npm run build 2>&1 | tee "$SDK_M3_LOGS/typescript-build.log"
+          npm run typecheck 2>&1 | tee "$SDK_M3_LOGS/typescript-typecheck.log"
+          node --test Expo/tests/m1-runtime.test.cjs 2>&1 | tee "$SDK_M3_LOGS/typescript-runtime.log"
+          node discovery/check_expo_plugin.cjs 2>&1 | tee "$SDK_M3_LOGS/plugin-controls.log"
+      - name: Prepare the default-media example
+        run: |
+          set -euo pipefail
+          npm exec --workspace ios-voip-sdk-example -- expo prebuild --platform ios --no-install 2>&1 | tee "$SDK_M3_LOGS/prebuild.log"
+          cd example/ios
+          pod install 2>&1 | tee "$SDK_M3_LOGS/pod-install.log"
+      - name: Build the source-bound direct-delivery example
+        run: bash discovery/build_sdk_m3.sh "$SDK_M3_BUILD"
+      - name: Measure direct URL and typed intent public events
+        run: |
+          python3 discovery/run_sdk_m3_direct.py --app "$SDK_M3_BUILD/Example.app" \
+            --build-receipt "$SDK_M3_BUILD/build-receipt.json" \
+            --runtime com.apple.CoreSimulator.SimRuntime.iOS-27-0 \
+            --out "$SDK_M3_OUT"
+          python3 discovery/sdk_m3_direct_conformance.py "$SDK_M3_OUT"
+      - name: Preserve evidence, including red measurements
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sdk-m3-direct-xcode-27.1
+          path: |
+            ${{ runner.temp }}/sdk-m3-native
+            ${{ runner.temp }}/sdk-m3-logs
+            ${{ runner.temp }}/sdk-m3-build/build-receipt.json
+            ${{ runner.temp }}/sdk-m3-build/source-before.json
+            ${{ runner.temp }}/sdk-m3-build/*-build.log
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove owned build caches
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/sdk-m3-build"

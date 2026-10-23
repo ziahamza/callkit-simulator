@@ -83,10 +83,13 @@ public final class VoIPApplication {
   /// Idempotent for the same launch configuration. A failed registration can retry
   /// without creating another manager or receiver.
   @discardableResult
-  public static func start(configuration: Configuration = .init()) throws -> VoIPApplication {
+  public static func start(configuration: Configuration = .init(), mediaAdapter: (any MediaAdapter)? = nil,
+                           audioPolicy: AudioActivationPolicy = .standard) throws -> VoIPApplication {
     try ProcessSDKOwnership.claim()
     if let current {
       guard current.configuration == configuration else { throw ConversationClientError.alreadyConfigured }
+      _ = try ConversationClient.forApplication(configuration: configuration.client,
+        mediaAdapter: mediaAdapter, audioPolicy: audioPolicy)
       current.client.finishLaunch()
       try current.pushService.start()
       return current
@@ -95,7 +98,8 @@ public final class VoIPApplication {
     starting = true
     defer { starting = false }
     try SimulatorSupport.configure(enabled: configuration.simulatorSupport)
-    let client = try ConversationClient.forApplication(configuration: configuration.client)
+    let client = try ConversationClient.forApplication(configuration: configuration.client,
+      mediaAdapter: mediaAdapter, audioPolicy: audioPolicy)
     let application = VoIPApplication(client: client, configuration: configuration)
     current = application
     client.finishLaunch()
@@ -104,8 +108,9 @@ public final class VoIPApplication {
   }
 
   @discardableResult
-  public static func startFromBundle(_ bundle: Bundle = .main) throws -> VoIPApplication {
-    try start(configuration: Configuration.fromBundle(bundle))
+  public static func startFromBundle(_ bundle: Bundle = .main, mediaAdapter: (any MediaAdapter)? = nil,
+                                     audioPolicy: AudioActivationPolicy = .standard) throws -> VoIPApplication {
+    try start(configuration: Configuration.fromBundle(bundle), mediaAdapter: mediaAdapter, audioPolicy: audioPolicy)
   }
 }
 #endif

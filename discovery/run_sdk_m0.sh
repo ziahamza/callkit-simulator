@@ -216,7 +216,7 @@ PY
   # The app is installed once and only relaunched below. Reuse its first
   # observed data container instead of making another IPC query after each case.
   contract_container=""
-  for case in guard unhandled-accept unhandled-fail duplicate-wrapper; do
+  for case in guard unhandled-accept unhandled-fail duplicate-wrapper media-reentrancy audio-lifecycle audio-routes; do
     name="sdk-m1-contract-$case"
     env SIMCTL_CHILD_DYLD_INSERT_LIBRARIES="$INHERITED_DYLD" \
       SIMCTL_CHILD_CKSIM_RUN_ID="$RUN_ID" SIMCTL_CHILD_SDK_M1_CONTRACT_CASE="$case" \

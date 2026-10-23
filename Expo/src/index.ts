@@ -9,6 +9,7 @@ import type {
 
 export * from './types';
 export {
+  useAudioRoutes,
   useConversation,
   useConversationEvent,
   useConversations,
@@ -17,6 +18,11 @@ export {
 
 export function getConversations(): Promise<readonly Conversation[]> {
   return getRuntime().getConversations();
+}
+
+/** Current state follows real route notifications after the native request. */
+export function selectAudioRoute(id: string): Promise<void> {
+  return getRuntime().bridge.selectAudioRoute(id);
 }
 
 /**

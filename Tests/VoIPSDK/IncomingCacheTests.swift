@@ -40,7 +40,7 @@ import Foundation
         "returnedCanonicalID": returned == reservation.id,
         "callerPayloadMatches": snapshotMatches(returned)]) { _, value in value }
 
-    case "joined-success":
+    case "joined-success", "joined-sibling-success":
       let reservation = try client.incomingIntake.reserve(payload, source: .pushKit)
       var entered = false
       let caller = Task { @MainActor () throws -> (UUID, Int, Bool) in
@@ -51,7 +51,13 @@ import Foundation
       }
       while !entered { await Task.yield() }
       manager.conversations = [Conversation(reservation.id, state: .idle)]
-      client.incomingIntake.complete(attempt(reservation), outcome: .reported)
+      if mode == "joined-sibling-success" {
+        let sibling = try client.incomingIntake.reserve(payload, source: .pushKit)
+        client.incomingIntake.complete(attempt(reservation), outcome: .failed(PlatformFailure.rejected))
+        client.incomingIntake.complete(attempt(sibling), outcome: .reported)
+      } else {
+        client.incomingIntake.complete(attempt(reservation), outcome: .reported)
+      }
       let observed = try await caller.value
       passed = observed.0 == reservation.id && observed.1 == 1 && observed.2
       result.merge(["callerCacheCount": observed.1, "callerPayloadMatches": observed.2,
@@ -60,13 +66,17 @@ import Foundation
     case "joined-failure":
       let id = try await client.reportIncomingConversation(payload)
       let seeded = snapshotMatches(id)
-      let reservation = try client.incomingIntake.reserve(payload, source: .pushKit)
-      precondition(reservation.id == id)
+      // A known owned call now returns its canonical UUID. Exercise a genuinely
+      // unreported invitation's failure while the separate cached call disappears.
+      var unreported = payload
+      unreported.eventId += "-unreported"; unreported.serverCallId += "-unreported"
+      let reservation = try client.incomingIntake.reserve(unreported, source: .pushKit)
+      precondition(reservation.id != id)
       var entered = false
       let caller = Task { @MainActor () -> (Bool, Int) in
         entered = true
         do {
-          _ = try await client.reportIncomingConversation(payload)
+          _ = try await client.reportIncomingConversation(unreported)
           return (false, client.snapshots.count)
         } catch PlatformFailure.rejected {
           // Capture in the caller's catch, with no yield or extra cache refresh.

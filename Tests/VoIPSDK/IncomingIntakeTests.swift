@@ -1,7 +1,10 @@
 import Foundation
 
-enum TestError: Error, Equatable { case reportFailed, duplicate }
-enum RegressionFailure: Error { case resetIdentity, resetProjection, staleGeneration, errorNotReleased }
+enum TestError: Error, Equatable { case reportFailed, siblingFailed, duplicate }
+enum RegressionFailure: Error {
+  case resetIdentity, resetProjection, staleGeneration, errorNotReleased
+  case foregroundJoinedRejected, foregroundOwnership
+}
 
 private final class DeinitCount: @unchecked Sendable {
   private let lock = NSLock()
@@ -48,6 +51,8 @@ struct IncomingIntakeTests {
       case "error-normalization": try reentrantErrorNormalization()
       case "error-reset": try reentrantErrorReset()
       case "reset-pending": try await resetRetainsUnsettledMetadata()
+      case "foreground-ownership": try await foregroundJoinsCanonicalOutcome()
+      case "reset-foreground-failure": try await resetParkedForegroundFailure()
       default: preconditionFailure("Unknown intake control")
       }
       print("Incoming intake focused control passed: \(control)")
@@ -55,6 +60,7 @@ struct IncomingIntakeTests {
     }
     try await concurrentReservation()
     try await independentPushAndForegroundJoin()
+    try await foregroundJoinsCanonicalOutcome()
     try await rollbackAndRetry()
     try await duplicateSettlementOrdering()
     try await observedMembershipWins()
@@ -66,7 +72,8 @@ struct IncomingIntakeTests {
     try reentrantErrorNormalization()
     try reentrantErrorReset()
     try await resetRetainsUnsettledMetadata()
-    print("Incoming intake: 13 host control groups passed (no framework/device claim)")
+    try await resetParkedForegroundFailure()
+    print("Incoming intake: 15 host control groups passed (no framework/device claim)")
   }
 
   static func concurrentReservation() async throws {
@@ -121,9 +128,13 @@ struct IncomingIntakeTests {
     let successorResult = try await successor.ticket.value
     precondition(successorResult == first.id && intake.hasPending(first.id),
       "The second report settles independently while its predecessor remains hung")
-    intake.complete(predecessor, outcome: .reported, now: now)
     let joinedResult = try await joined.value
-    precondition(joinedResult == first.id && !intake.hasPending(first.id))
+    precondition(joinedResult == first.id && intake.hasPending(first.id),
+      "Foreground callers observe canonical ownership without waiting for the hung predecessor")
+    let known = try intake.reserve(payload("known"), source: .foreground, now: now)
+    guard case .reported = known.disposition else { throw RegressionFailure.foregroundOwnership }
+    intake.complete(predecessor, outcome: .reported, now: now)
+    precondition(!intake.hasPending(first.id))
   }
 
   static func rollbackAndRetry() async throws {
@@ -131,13 +142,13 @@ struct IncomingIntakeTests {
     let first = try intake.reserve(payload(), source: .pushKit, now: now)
     let second = try intake.reserve(payload("another"), source: .pushKit, now: now)
     intake.complete(attempt(first), outcome: .failed(TestError.reportFailed), now: now)
-    await fails(attempt(first).ticket, with: .reportFailed)
     precondition(intake.projection(first.id)?.payload == first.payload && intake.hasPending(first.id),
       "Earlier failure cannot erase the successor's metadata or invitation association")
     precondition(!intake.removeConversation(first.id, now: now),
       "Record cleanup cannot retire an in-flight report")
-    intake.complete(attempt(second), outcome: .failed(TestError.reportFailed), now: now)
-    await fails(attempt(second).ticket, with: .reportFailed)
+    intake.complete(attempt(second), outcome: .failed(TestError.siblingFailed), now: now)
+    await fails(attempt(first).ticket, with: .reportFailed)
+    await fails(attempt(second).ticket, with: .siblingFailed)
     precondition(intake.projection(first.id) == nil && !intake.hasPending(first.id))
     let retry = try intake.reserve(payload(), source: .foreground, now: now)
     precondition(retry.id != first.id && retry.generation != first.generation,
@@ -147,6 +158,31 @@ struct IncomingIntakeTests {
       "An old repeated settlement cannot affect its replacement")
     intake.complete(attempt(retry), outcome: .reported, now: now)
     _ = try await attempt(retry).ticket.value
+  }
+
+  static func foregroundJoinsCanonicalOutcome() async throws {
+    for successFirst in [false, true] {
+      let intake = IncomingIntake()
+      let first = try intake.reserve(payload(), source: .foreground, now: now)
+      let foreground = try intake.reserve(payload("foreground"), source: .foreground, now: now)
+      guard case .join(let joined) = foreground.disposition else {
+        preconditionFailure("A foreground duplicate must await the existing lifetime")
+      }
+      let second = try intake.reserve(payload("push"), source: .pushKit, now: now)
+      if successFirst {
+        intake.complete(attempt(second), outcome: .reported, now: now)
+      }
+      intake.complete(attempt(first), outcome: .failed(TestError.reportFailed), now: now)
+      if !successFirst {
+        intake.complete(attempt(second), outcome: .reported, now: now)
+      }
+      do {
+        let result = try await joined.value
+        precondition(result == first.id)
+      } catch { throw RegressionFailure.foregroundJoinedRejected }
+      let known = try intake.reserve(payload("known"), source: .foreground, now: now)
+      guard case .reported = known.disposition else { throw RegressionFailure.foregroundOwnership }
+    }
   }
 
   static func duplicateSettlementOrdering() async throws {
@@ -184,7 +220,8 @@ struct IncomingIntakeTests {
     let result = try await attempt(second).ticket.value
     precondition(result == first.id)
     intake.complete(attempt(first), outcome: .failed(TestError.reportFailed), now: now)
-    await fails(attempt(first).ticket, with: .reportFailed)
+    let firstResult = try await attempt(first).ticket.value
+    precondition(firstResult == first.id, "Observed ownership also settles the canonical foreground result")
     precondition(intake.projection(first.id)?.payload == first.payload && !intake.hasPending(first.id),
       "Actual observed membership prevents rollback even when report completion fails")
     let foreground = try intake.reserve(payload("foreground"), source: .foreground, now: now)
@@ -346,15 +383,24 @@ struct IncomingIntakeTests {
   }
 
   static func reentrantErrorNormalization() throws {
+    for ordinary in [false, true] { try reentrantErrorNormalization(ordinary: ordinary) }
+  }
+
+  static func reentrantOutcome(_ ordinary: Bool, _ onDeinit: @escaping @Sendable () -> Void) -> IncomingIntake.ReportOutcome {
+    let error = ReentrantError(onDeinit)
+    return ordinary ? .failed(error) : .alreadyReported(error)
+  }
+
+  static func reentrantErrorNormalization(ordinary: Bool) throws {
     let intake = IncomingIntake()
     let counter = DeinitCount()
     let first = try intake.reserve(payload(), source: .pushKit, now: now)
     let duplicate = try intake.reserve(payload("duplicate"), source: .pushKit, now: now)
-    intake.complete(attempt(duplicate), outcome: .alreadyReported(ReentrantError {
+    intake.complete(attempt(duplicate), outcome: reentrantOutcome(ordinary) {
       _ = intake.projection(first.id)
       counter.increment()
-    }), now: now)
-    precondition(counter.value == 0, "Unclassified duplicate retains its external error")
+    }, now: now)
+    precondition(counter.value == 0, "A settled failure retains its external error until ownership is established")
     intake.complete(attempt(first), outcome: .reported, now: now)
     guard counter.value == 1 else { throw RegressionFailure.errorNotReleased }
 
@@ -362,27 +408,54 @@ struct IncomingIntakeTests {
     let observedCount = DeinitCount()
     let live = try observed.reserve(payload(), source: .pushKit, now: now)
     let repeated = try observed.reserve(payload("duplicate"), source: .pushKit, now: now)
-    observed.complete(attempt(repeated), outcome: .alreadyReported(ReentrantError {
+    observed.complete(attempt(repeated), outcome: reentrantOutcome(ordinary) {
       _ = observed.projection(live.id)
       observedCount.increment()
-    }), now: now)
+    }, now: now)
     observed.observeMembership(live.id, now: now)
     guard observedCount.value == 1 else { throw RegressionFailure.errorNotReleased }
     observed.complete(attempt(live), outcome: .reported, now: now)
   }
 
   static func reentrantErrorReset() throws {
+    for ordinary in [false, true] { try reentrantErrorReset(ordinary: ordinary) }
+  }
+
+  static func reentrantErrorReset(ordinary: Bool) throws {
     let intake = IncomingIntake()
     let counter = DeinitCount()
     _ = try intake.reserve(payload(), source: .pushKit, now: now)
     let duplicate = try intake.reserve(payload("duplicate"), source: .pushKit, now: now)
-    intake.complete(attempt(duplicate), outcome: .alreadyReported(ReentrantError {
+    intake.complete(attempt(duplicate), outcome: reentrantOutcome(ordinary) {
       _ = intake.hasPending(duplicate.id)
       counter.increment()
-    }), now: now)
+    }, now: now)
     precondition(counter.value == 0)
     intake.reset()
     guard counter.value == 1 else { throw RegressionFailure.errorNotReleased }
+  }
+
+  static func resetParkedForegroundFailure() async throws {
+    let intake = IncomingIntake()
+    let first = try intake.reserve(payload(), source: .foreground, now: now)
+    let foreground = try intake.reserve(payload("foreground"), source: .foreground, now: now)
+    guard case .join(let joined) = foreground.disposition else { throw RegressionFailure.foregroundOwnership }
+    let second = try intake.reserve(payload("push"), source: .pushKit, now: now)
+    intake.complete(attempt(first), outcome: .failed(TestError.reportFailed), now: now)
+    intake.reset(now: now)
+    for ticket in [joined, attempt(first).ticket, attempt(second).ticket] {
+      do { _ = try await ticket.value; preconditionFailure("Reset must fail canonical and pending public results") }
+      catch { precondition(error as? IncomingIntake.IntakeError == .managerReset) }
+    }
+    let retry = try intake.reserve(payload(), source: .foreground, now: now)
+    precondition(retry.id != first.id && retry.generation != first.generation)
+    intake.complete(attempt(second), outcome: .reported, now: now)
+    intake.observeMembership(first.id, now: now)
+    precondition(intake.projection(first.id)?.terminal?.ended.reason == .failed &&
+                 intake.projection(retry.id)?.terminal == nil && !intake.hasPending(first.id),
+                 "Late old success only drains reset work; it cannot own or replace the new invitation")
+    intake.complete(attempt(retry), outcome: .reported, now: now)
+    _ = try await attempt(retry).ticket.value
   }
 
   static func resetRetainsUnsettledMetadata() async throws {

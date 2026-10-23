@@ -1,5 +1,6 @@
 #if os(iOS) && targetEnvironment(simulator)
 import Foundation
+import Darwin
 #if SWIFT_PACKAGE
 import CKSimRuntimeC
 #endif
@@ -27,6 +28,7 @@ private struct BehaviorProfile: Decodable {
   let ordinaryDeadlineSeconds: Double
   let lckActionDeadlineSeconds: Double
   let reportLatencySeconds: Double
+  let pushReportDeadlineSeconds: Double
   let muteEchoSeconds: Double
   let postEndUnmuteSeconds: Double
   let fulfilledPostEndUnmutePolicy: FulfilledPostEndUnmutePolicy
@@ -170,6 +172,7 @@ private struct PushReportingObligations {
   }
   private struct Delivery {
     let required: Bool
+    let token = UUID()
     var reportEntered = false
     var returned = false
     var completed = false
@@ -183,6 +186,13 @@ private struct PushReportingObligations {
   mutating func entered(_ id: String) {
     guard !id.isEmpty else { return }
     deliveries[id]?.reportEntered = true
+    if let delivery = deliveries[id], delivery.returned && delivery.completed { deliveries.removeValue(forKey: id) }
+  }
+  func deadlineToken(_ id: String) -> UUID? { deliveries[id]?.token }
+  mutating func expire(_ id: String, token: UUID) -> Bool {
+    guard let delivery = deliveries[id], delivery.token == token, delivery.required, !delivery.reportEntered else { return false }
+    deliveries.removeValue(forKey: id)
+    return true
   }
   mutating func returned(_ id: String) -> Observation {
     observe(id, completion: false)
@@ -198,7 +208,7 @@ private struct PushReportingObligations {
     if completion { delivery.completed = true } else { delivery.returned = true }
     let violation = repeated ? "repeated-" + (completion ? "completion" : "callback-return") :
       delivery.required && !delivery.reportEntered ? "required-report-missing-at-" + (completion ? "completion" : "callback-return") : nil
-    if delivery.completed && delivery.returned { deliveries.removeValue(forKey: id) }
+    if delivery.completed && delivery.returned && (!delivery.required || delivery.reportEntered) { deliveries.removeValue(forKey: id) }
     else { deliveries[id] = delivery }
     return Observation(required: delivery.required, reportEntered: delivery.reportEntered, violation: violation)
   }
@@ -263,7 +273,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
     profile = try JSONDecoder().decode(BehaviorProfile.self, from: Self.profileData(profileID))
     let durations = [profile.answerExpirySeconds, profile.ringTimeoutSeconds, profile.unknownProviderSeconds,
       profile.actionTimeoutSeconds, profile.startDeadlineSeconds, profile.answerDeadlineSeconds,
-      profile.ordinaryDeadlineSeconds, profile.lckActionDeadlineSeconds, profile.reportLatencySeconds, profile.muteEchoSeconds, profile.postEndUnmuteSeconds]
+      profile.ordinaryDeadlineSeconds, profile.lckActionDeadlineSeconds, profile.pushReportDeadlineSeconds, profile.reportLatencySeconds, profile.muteEchoSeconds, profile.postEndUnmuteSeconds]
     guard profile.schemaVersion == 1 && profile.id == profileID && durations.allSatisfy({ $0.isFinite && $0 > 0 }) else {
       throw BootstrapError.invalid("invalid behavior profile")
     }
@@ -340,7 +350,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
     "livecommunicationkit": "complete"
   },
   "fulfilledPostEndUnmuteEvidence": {
-    "callkit": "Measured fulfilled post-end unmute still times out in 5.0–5.9 s.",
+    "callkit": "Measured fulfilled post-end unmute still times out in 5.0\u20135.9 s.",
     "livecommunicationkit": "Measured no timeout through 5.542 s after fulfilled post-end unmute; terminal settlement follows public fulfill/complete semantics, not a measured infinite observation."
   },
   "lckActionDeadlineSeconds": 30,
@@ -364,6 +374,15 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
         "sha256": "23ab443e1fd8623140e95cc7d34157d5fd8aa7d13b6321f90e1812825f65a042",
         "samples": 4
       }
+    }
+  },
+  "pushReportDeadlineSeconds": 4.4,
+  "pushReportDeadlineEvidence": {
+    "measured": "Approximate 4.4 s termination and PKPushRegistry crash attribution from the device pass writeup; raw late-5s trace ends alive at4.200 s without a kill event.",
+    "reference": "docs/research/callkit-simulator-probe/livecommunicationkit/push/README.md",
+    "captures": {
+      "docs/research/callkit-simulator-probe/livecommunicationkit/push/2026-10-23-iphone13-ios27-late-report-3s.jsonl": "1ed65280b43ebe27ab8b52535bb7b1df15b301e4eb9ab6d690cc9c8690ef36cf",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/push/2026-10-23-iphone13-ios27-late-report-5s.jsonl": "65aa587060ac3a2e5a898d97675e0c902dba70d7c8bf0b2d7dad0ab8ad29da2c"
     }
   }
 }
@@ -426,12 +445,12 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
     if DispatchQueue.getSpecific(key: stateKey) == true { return body() }
     return state.sync(execute: body)
   }
-  private func after(_ seconds: Double, _ body: @escaping @Sendable () -> Void) {
+  private func after(_ seconds: Double, from start: DispatchTime = .now(), _ body: @escaping @Sendable () -> Void) {
     guard !stopped else { return }
     let id = UUID()
     let timer = DispatchSource.makeTimerSource(flags: .strict, queue: state)
     timers[id] = timer
-    timer.schedule(deadline: .now() + seconds, leeway: .milliseconds(1))
+    timer.schedule(deadline: start + seconds, leeway: .milliseconds(1))
     timer.setEventHandler { [weak self] in
       guard let self, !self.stopped else { return }
       let fired = self.timers.removeValue(forKey: id)
@@ -444,13 +463,18 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
   func record(event: String, fields: [String: Any]) {
     withState {
       guard !stopped else { return }
+      let observed = DispatchTime.now()
       var row = fields
       var pushViolation: String?
+      var pushDeadline: (String, UUID, DispatchTime)?
       if let pushID = fields["pushID"] as? String, !pushID.isEmpty {
         switch event {
         case "push.received":
-          if !pushReportingObligations.receive(pushID, required: fields["mustReport"] as? Bool ?? true) {
+          let required = fields["mustReport"] as? Bool ?? true
+          if !pushReportingObligations.receive(pushID, required: required) {
             pushViolation = "repeated-delivery"
+          } else if required, let token = pushReportingObligations.deadlineToken(pushID) {
+            pushDeadline = (pushID, token, observed)
           }
         case "report.incoming": pushReportingObligations.entered(pushID)
         case "push.completed", "push.callbackReturned":
@@ -466,9 +490,18 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       row.merge(["schemaVersion": 1, "event": event, "sequence": sequence, "runID": runID, "pid": Int(getpid()),
                  "bundleID": bundleID, "profile": profile.id,
                  "wallTimeMS": Int64(Date().timeIntervalSince1970 * 1000),
-                 "t_ms": (DispatchTime.now().uptimeNanoseconds - epoch) / 1_000_000]) { _, new in new }
+                 "t_ms": (observed.uptimeNanoseconds - epoch) / 1_000_000]) { _, new in new }
       if let data = try? JSONSerialization.data(withJSONObject: row, options: [.sortedKeys]) {
         journal?.write(data + Data([10]))
+      }
+      if let (pushID, token, receivedAt) = pushDeadline {
+        record(event: "push.reportDeadline", fields: ["pushID": pushID, "seconds": profile.pushReportDeadlineSeconds])
+        after(profile.pushReportDeadlineSeconds, from: receivedAt) { [weak self] in
+          guard let self, self.pushReportingObligations.expire(pushID, token: token) else { return }
+          self.record(event: "diagnostic.pushReportExpired", fields: ["pushID": pushID, "severity": "error",
+            "seconds": self.profile.pushReportDeadlineSeconds, "exitCode": 78])
+          Darwin._exit(78)
+        }
       }
       if let pushViolation {
         record(event: "diagnostic.pushReportingViolation", fields: ["severity": "error", "reason": pushViolation,

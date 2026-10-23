@@ -35,7 +35,7 @@ def fixtures(work):
         f"if mode=='buffered-header': os.write(1,{RAW_OUTPUT!r})\n"
         "if mode=='stdout-eof': os.close(1)\n"
         "rows=[{'event':'app.entry','t_ms':0},{'event':'launch','t_ms':1,'pid':os.getpid()}]\n"
-        "if mode!='early-exit': rows.append({'event':'done','t_ms':2})\n"
+        "if mode!='early-exit' and (not mode.startswith('natural-') or mode=='natural-done'): rows.append({'event':'done','t_ms':2})\n"
         "for row in rows:\n"
         " data=('PROBE '+json.dumps(row)+'\\n').encode()\n"
         " if mode=='interleaved-streams' and row['event']=='launch':\n"
@@ -49,6 +49,10 @@ def fixtures(work):
         "if mode=='early-exit':\n"
         " os.close(1); os.close(2)\n"
         "pathlib.Path(str(base)+'.emitted').touch()\n"
+        "if mode.startswith('natural-'):\n"
+        " if mode in ('natural-app-alive','natural-cleanup-death'): os.close(1); os.close(2)\n"
+        " if mode in ('natural-app-alive','natural-cleanup-death','natural-timeout'): time.sleep(60)\n"
+        " sys.exit(78)\n"
         "if mode in ('quiet-orphan','delayed-handler'): os.close(1); os.close(2)\n"
         "if mode=='orphan-output':\n"
         " deadline=time.monotonic()+60\n"
@@ -74,6 +78,18 @@ def fixtures(work):
         "if mode in ('buffered-header','quiet-orphan','stdout-eof'): print('" + BUNDLE + ": '+str(app.pid),flush=mode!='buffered-header')\n"
         "if mode=='stdout-eof': os.close(1)\n"
         "pathlib.Path(str(base)+'.ready').touch()\n"
+        "if mode.startswith('natural-'):\n"
+        " deadline=time.monotonic()+20\n"
+        " while not pathlib.Path(str(base)+'.emitted').exists():\n"
+        "  if time.monotonic()>deadline: sys.exit(8)\n"
+        "  time.sleep(.01)\n"
+        " if mode!='natural-missing-pid':\n"
+        "  header='" + BUNDLE + ": '+str(app.pid+(1 if mode=='natural-wrong-pid' else 0))\n"
+        "  for _ in range(2 if mode=='natural-duplicate-pid' else 1): print(header,flush=True)\n"
+        " if mode=='natural-app-alive': sys.exit(78)\n"
+        " if mode=='natural-cleanup-death': os.close(1); os.close(2)\n"
+        " app.wait()\n"
+        " sys.exit(0 if mode=='natural-zero' else 7 if mode=='natural-bad-status' else 78)\n"
         "if mode=='delayed-handler':\n"
         " deadline=time.monotonic()+20\n"
         " while not pathlib.Path(str(base)+'.emitted').exists():\n"
@@ -122,18 +138,31 @@ def alive(pid):
         return False
 
 
-def run_case(work, sources, mode, console=True):
+def run_case(work, sources, mode, console=True, expected_app_exit=False, timeout=20):
     child, launcher, fallback = sources
-    base = work / (("console-" if console else "traditional-") + mode)
+    prefix = "expected-exit-" if expected_app_exit else "console-" if console else "traditional-"
+    base = work / (prefix + mode)
     receipt = Path(str(base) + ".receipt.json")
     output = Path(str(base) + ".log")
     command = [sys.executable, str(ROOT / "run_scenario.py"),
                "--output", str(output), "--receipt", str(receipt),
-               "--timeout", "20", "--bundle-id", BUNDLE]
+               "--timeout", str(timeout), "--bundle-id", BUNDLE]
     if console:
         command.append("--console-launcher-stop")
     command += ["--terminate-command", sys.executable, str(fallback), str(base),
                 "--launch-command", sys.executable, str(launcher), str(child), str(base), mode]
+    if expected_app_exit:
+        # The opt-in is intentionally a run() API, not a normal-stop CLI flag.
+        # Keep its supervisor in a separate bounded process like the default path.
+        command = [sys.executable, "-c",
+                   "import json,sys; from pathlib import Path; sys.path.insert(0,sys.argv[1]); "
+                   "from run_scenario import run; "
+                   "raise SystemExit(run(json.loads(sys.argv[2]),json.loads(sys.argv[3]),"
+                   "Path(sys.argv[4]),Path(sys.argv[5]),float(sys.argv[6]),"
+                   "{'bundleID':sys.argv[7]},console_launcher_stop=True,expected_app_exit=True))",
+                   str(ROOT), json.dumps([sys.executable, str(launcher), str(child), str(base), mode]),
+                   json.dumps([sys.executable, str(fallback), str(base)]),
+                   str(output), str(receipt), str(timeout), BUNDLE]
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=60)
         require(receipt.exists(), f"{base.name}: missing receipt: {result.stderr}")
@@ -229,6 +258,72 @@ def failed_exec_control(work):
     return "runner-console-failed-exec-closes-pty"
 
 
+def expected_exit_controls(work, sources):
+    from summarize import successful_stop
+
+    checks = []
+    for mode, status in (("natural-78", 78), ("natural-zero", 0)):
+        result, receipt, base = run_case(work, sources, mode, expected_app_exit=True)
+        require(result.returncode == 0 and receipt.get("success") is True and
+                receipt.get("completed") is False and receipt.get("expectedAppExit") is True and
+                receipt.get("terminationMethod") == "natural-app-exit" and
+                receipt.get("launchExitCode") == receipt.get("launchExitCodeBeforeCleanup") == status and
+                receipt.get("appAbsentBeforeCleanup") is True and
+                receipt.get("appAbsenceMethod") == "signal-zero",
+                f"runner-{mode}: natural exit lacks pre-cleanup proof: {receipt}")
+        require(receipt.get("appPID") == receipt.get("launcherAppPID") ==
+                int(Path(str(base) + ".app.pid").read_text()) and
+                receipt.get("launcherPID") == int(Path(str(base) + ".launcher.pid").read_text()) and
+                receipt["launcherPID"] != receipt["appPID"],
+                f"runner-{mode}: natural exit PID identity differs: {receipt}")
+        require(not any(key in receipt for key in ("terminationSignal", "terminationSignalDelivered",
+                    "terminateExitCode", "cleanupExitCode", "cleanupError")) and
+                not Path(str(base) + ".signal").exists() and not Path(str(base) + ".fallback").exists(),
+                f"runner-{mode}: cleanup caused the accepted exit: {receipt}")
+        lines = Path(str(base) + ".log").read_text().splitlines()
+        require(lines.count(f"{BUNDLE}: {receipt['appPID']}") == 1 and
+                [json.loads(line.split("PROBE ", 1)[1])["event"] for line in lines if "PROBE " in line] ==
+                ["app.entry", "launch"] and not successful_stop(receipt),
+                f"runner-{mode}: natural exit became ordinary terminal success: {receipt}")
+        checks.append(f"runner-console-opt-in-{mode}")
+    result, receipt, base = run_case(work, sources, "natural-78")
+    require(result.returncode != 0 and receipt.get("success") is False and
+            receipt.get("completed") is False and "expectedAppExit" not in receipt and
+            "launcher exited before terminal done event" in receipt.get("error", "") and
+            Path(str(base) + ".fallback").exists() and receipt.get("cleanupExitCode") == 7 and
+            not successful_stop(receipt),
+            f"default console path accepted natural exit: {receipt}")
+    checks.append("runner-console-default-rejects-natural-78")
+
+    failures = (
+        ("natural-wrong-pid", "launcher/probe app PID mismatch"),
+        ("natural-missing-pid", "require one launcher app PID acknowledgement"),
+        ("natural-duplicate-pid", "require one launcher app PID acknowledgement"),
+        ("natural-app-alive", "run-owned app remains alive before natural-exit cleanup"),
+        ("natural-done", "expected app exit received terminal done event"),
+        ("natural-bad-status", "unexpected natural-exit launcher status"),
+        ("natural-timeout", "deadline before terminal done event"),
+        ("natural-cleanup-death", "timed out"),
+    )
+    for mode, error in failures:
+        result, receipt, base = run_case(work, sources, mode, expected_app_exit=True,
+                                         timeout=2 if mode == "natural-timeout" else 20)
+        require(result.returncode != 0 and receipt.get("success") is False and
+                receipt.get("completed") is False and error in receipt.get("error", "") and
+                receipt.get("appAbsentBeforeCleanup") is not True and not successful_stop(receipt),
+                f"runner-{mode}: expected-exit refusal differs: {receipt}")
+        require(Path(str(base) + ".fallback").exists() and receipt.get("cleanupExitCode") == 7,
+                f"runner-{mode}: failure did not clean its own app: {receipt}")
+        if mode in ("natural-timeout", "natural-cleanup-death"):
+            # The launcher can return an otherwise acceptable status only AFTER
+            # fallback kills its app. That must never become natural-exit proof.
+            require(receipt.get("launchExitCodeBeforeCleanup") is None and
+                    receipt.get("launchExitCode") == 78,
+                    f"runner-{mode}: cleanup did not exercise late launcher death: {receipt}")
+        checks.append(f"runner-console-opt-in-rejects-{mode}")
+    return checks
+
+
 def run_checks(work):
     work.mkdir(parents=True, exist_ok=True)
     sources = fixtures(work)
@@ -294,6 +389,7 @@ def run_checks(work):
                         "launcher exited before terminal done event" in receipt.get("error", ""),
                         f"runner-console-{mode}: lost early-exit error: {receipt}")
         checks.append(f"runner-console-{mode}")
+    checks.extend(expected_exit_controls(work, sources))
     return checks
 
 

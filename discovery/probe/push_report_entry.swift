@@ -43,10 +43,11 @@ private final class GenericEntryDelegate: NSObject, @preconcurrency PKPushRegist
   func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload,
                     for type: PKPushType, completion: @escaping () -> Void) { receive(completion) }
   private func receive(_ completion: @escaping () -> Void) {
-    guard mode == "deferred" else { completion(); return }
+    let late = mode == "late-report"
+    guard mode == "deferred" || late else { completion(); return }
     let push = SimulatorSupport.currentPushIdentifier
     Task { @MainActor in
-      try? await Task.sleep(for: .milliseconds(100))
+      try? await Task.sleep(for: .milliseconds(late ? 5_000 : 100))
       await SimulatorPushContext.$pushIdentifier.withValue(push) {
         let id = UUID()
         SimulatorSupport.associateIncomingReport(id)
@@ -54,8 +55,10 @@ private final class GenericEntryDelegate: NSObject, @preconcurrency PKPushRegist
         try? await manager.reportNewIncomingConversation(uuid: id, update: .init(
           members: [Handle(type: .generic, value: "entry-negative")], capabilities: []))
       }
-      completion()
+      if !late { completion() }
     }
+    // Returning and completing must not cancel the independent report deadline.
+    if late { completion() }
   }
 }
 
@@ -94,6 +97,7 @@ private final class EntryProbe {
         EntryTrace.log("entry.inject", ["pushID": pushID, "mustReport": required])
         CKSimInjectPush(payload, required, pushID)
       }
+      if mode == "late-report" { try await Task.sleep(for: .seconds(6)) }
       let deadline = ContinuousClock.now.advanced(by: .seconds(7))
       var completed = false
       while ContinuousClock.now < deadline {

@@ -173,9 +173,11 @@ class Journey:
         self.wait(lambda: self.snapshot(lambda calls: all(value['id'] != call['conversationID'] for value in calls)))
 
     def run(self):
-        env = dict(os.environ, SIMCTL_CHILD_CKSIM_RUN_ID=self.args.run_id,
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(('SIMCTL_CHILD_SDK_M2_', 'SIMCTL_CHILD_SDK_M3_'))}
+        env.update(SIMCTL_CHILD_CKSIM_RUN_ID=self.args.run_id,
             SIMCTL_CHILD_SDK_SYSTEM_RUN_ID=self.args.run_id, SIMCTL_CHILD_SDK_SYSTEM_CASE=self.case,
-            SIMCTL_CHILD_SDK_M0_ACCEPTANCE='0', SIMCTL_CHILD_SDK_M1_CASE='')
+            SIMCTL_CHILD_SDK_M0_ACCEPTANCE='0', SIMCTL_CHILD_SDK_M1_CASE='', SIMCTL_CHILD_SDK_M2_CASE='')
         launch = ['xcrun', 'simctl', 'launch', '--console', self.args.simulator, BUNDLE]
         if self.case == 'push-launch':
             path = self.root / 'first.payload.json'

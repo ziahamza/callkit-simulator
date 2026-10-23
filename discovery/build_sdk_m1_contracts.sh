@@ -38,7 +38,7 @@ for source in Sources/Interposition/CKInterposition.m Sources/Interposition/CKPu
     -DDEBUG=1 -DCKSIM_SDK_SOURCE=1 -DCKSIM_RUNTIME_VERSION=\""$VERSION"\" \
     -c "$source" -o "$WORK/$(basename "$source" .m).o" >> "$OUT/build.log" 2>&1
 done
-limit 180 xcrun --sdk iphonesimulator swiftc -target "$TARGET" -sdk "$SDK" -swift-version 6 -D DEBUG -parse-as-library \
+limit 180 xcrun --sdk iphonesimulator swiftc -target "$TARGET" -sdk "$SDK" -swift-version 6 -D DEBUG -Xcc -DDEBUG=1 -parse-as-library \
   -import-objc-header "$WORK/ContractHeaders.h" Sources/Engine/*.swift Sources/VoIPSDK/*.swift \
   discovery/probe/sdk_m1_contracts.swift "$WORK/"*.o -o "$APP/SDKM1Contracts" >> "$OUT/build.log" 2>&1
 limit 30 codesign -s - --force "$APP" >> "$OUT/build.log" 2>&1

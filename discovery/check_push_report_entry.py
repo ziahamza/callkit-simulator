@@ -51,6 +51,19 @@ POLICY = r'''
     precondition(policy.returned("other").violation == "repeated-callback-return")
     precondition(policy.returned("unknown").violation == "unknown-delivery")
     precondition(!policy.receive("", required:true))
+    var expiry = PushReportingObligations()
+    precondition(expiry.receive("pending", required:true))
+    let firstToken = expiry.deadlineToken("pending")!
+    _ = expiry.completed("pending"); _ = expiry.returned("pending")
+    precondition(expiry.expire("pending", token:firstToken), "completion/return cannot cancel a required report")
+    precondition(expiry.receive("pending", required:true))
+    let secondToken = expiry.deadlineToken("pending")!
+    precondition(!expiry.expire("pending", token:firstToken), "old timers cannot expire a reused identifier")
+    expiry.entered("pending")
+    precondition(!expiry.expire("pending", token:secondToken), "actual report entry satisfies the deadline")
+    precondition(expiry.completed("pending").reportEntered && expiry.returned("pending").reportEntered)
+    precondition(expiry.receive("optional-expiry", required:false))
+    precondition(!expiry.expire("optional-expiry", token:expiry.deadlineToken("optional-expiry")!))
     print("passed: required missing/late report, hook-entry observation, completion-before-return, optional omission, repeated/unknown boundaries and overlapping push isolation")
   }
 }
@@ -191,6 +204,10 @@ def native_source_identity():
            'Tests/VoIPSDK/IncomingCacheTests.swift','Tests/VoIPSDK/run_incoming_cache.py']
     scope += ['discovery/probe/push_entry_main_stall.h','discovery/probe/push_entry_main_stall.m',
               'discovery/push_main_stall_conformance.py','discovery/check_push_main_stall.py']
+    scope += ['discovery/check_console_stop.py',
+              'docs/research/callkit-simulator-probe/livecommunicationkit/push/README.md',
+              'docs/research/callkit-simulator-probe/livecommunicationkit/push/2026-10-23-iphone13-ios27-late-report-3s.jsonl',
+              'docs/research/callkit-simulator-probe/livecommunicationkit/push/2026-10-23-iphone13-ios27-late-report-5s.jsonl']
     dirty=subprocess.check_output(['git','status','--porcelain','--untracked-files=all','--',*scope],cwd=ROOT)
     if dirty: raise RuntimeError('Commit all A1 source/fixture inputs before a native measurement')
     names=sorted(filter(None,subprocess.check_output(['git','ls-files','-z','--',*scope],cwd=ROOT).decode().split('\0')))
@@ -228,6 +245,10 @@ def qualify_journal(rows, mode, run_id, pid):
     settlements=[r for r in rows if r.get('event')=='report.completed']
     require(all(r.get('pushID') in expected for r in incoming+settlements),'unbound incoming report or settlement')
     required=mode!='optional'
+    deadlines=[r for r in rows if r.get('event')=='push.reportDeadline']
+    require(len(deadlines)==(count if required else 0) and all(r.get('pushID') in expected for r in deadlines),
+            'missing, extra or unbound push report deadline')
+    seconds=json.loads((ROOT/'Sources/Engine/Resources/ios-27.0.json').read_text())['pushReportDeadlineSeconds']
     for identifier in expected:
         def event(name):
             found=[r for r in rows if r.get('event')==name and r.get('pushID')==identifier]
@@ -238,6 +259,10 @@ def qualify_journal(rows, mode, run_id, pid):
         require(all(r.get('api')=='metadata' for r in (received_row,returned,completed)),'expected metadata delivery path')
         require(received_row['sequence']<min(returned['sequence'],completed['sequence']),'delivery boundaries precede receipt')
         if required:
+            deadline=event('push.reportDeadline')
+            require(type(deadline.get('seconds')) in (int,float) and deadline['seconds']==seconds and
+                    deadline['sequence']==received_row['sequence']+1,
+                    'push report deadline differs from the profile or delivery boundary')
             require(returned.get('reportEntered') is True,'required report was not entered before callback returned')
             require(completed.get('reportEntered') is True,'required completion preceded report entry')
             report=event('report.incoming'); settled=event('report.completed')
@@ -263,47 +288,50 @@ def qualify_journal(rows, mode, run_id, pid):
 
 def journal_controls():
     def fixture():
-        return [dict(event=event,pid=123,runID='host',bundleID='dev.iosvoipsdk.pushentry',sequence=i+1,t_ms=i,
+        rows=[dict(event=event,pid=123,runID='host',bundleID='dev.iosvoipsdk.pushentry',sequence=i+1,t_ms=i,
                      pushID='host-0',mustReport=True,reportEntered=True,api='metadata',error=0,
                      callUUID='E715ACF2-A7C1-4D74-8BD9-EAFA47693255') for i,event in enumerate([
                      'push.received','report.incoming','report.completed','push.callbackReturned','push.completed'])]
+        rows.insert(1,dict(rows[0],event='push.reportDeadline',seconds=4.4))
+        for index,row in enumerate(rows): row.update(sequence=index+1,t_ms=index)
+        return rows
     qualify_journal(fixture(),'sdk-required','host',123)
     controls=[]
     for label, mutate in [
-        ('return-before-report',lambda r:r[3].update(reportEntered=False)),
-        ('completion-before-entry',lambda r:r[4].update(reportEntered=False)),
-        ('missing-report',lambda r:r.__delitem__(1)),
-        ('wrong-push',lambda r:r[1].update(pushID='other')),
-        ('wrong-settled-call',lambda r:r[2].update(callUUID='9BB7DFDA-423D-4FA8-9202-055C5750FD55')),
-        ('empty-report-call',lambda r:r[1].update(callUUID='')),
-        ('invalid-settled-call',lambda r:r[2].update(callUUID='call')),
-        ('orphan-settlement',lambda r:r.append(dict(r[2],sequence=6,t_ms=5,pushID='other'))),
-        ('wrong-process',lambda r:r[2].update(pid=124)),
+        ('return-before-report',lambda r:r[4].update(reportEntered=False)),
+        ('completion-before-entry',lambda r:r[5].update(reportEntered=False)),
+        ('missing-report',lambda r:r.__delitem__(2)),
+        ('wrong-push',lambda r:r[2].update(pushID='other')),
+        ('wrong-settled-call',lambda r:r[3].update(callUUID='9BB7DFDA-423D-4FA8-9202-055C5750FD55')),
+        ('empty-report-call',lambda r:r[2].update(callUUID='')),
+        ('invalid-settled-call',lambda r:r[3].update(callUUID='call')),
+        ('orphan-settlement',lambda r:r.append(dict(r[3],sequence=7,t_ms=6,pushID='other'))),
+        ('wrong-process',lambda r:r[3].update(pid=124)),
         ('boolean-pid',lambda r:r[0].update(pid=True)),
-        ('float-sequence',lambda r:r[2].update(sequence=3.0)),
-        ('clock-reversal',lambda r:r[3].update(t_ms=0)),
+        ('float-sequence',lambda r:r[3].update(sequence=4.0)),
+        ('clock-reversal',lambda r:r[4].update(t_ms=0)),
         ('missing-completion',lambda r:r.pop()),
         ('legacy-receipt',lambda r:r[0].update(api='legacy')),
-        ('legacy-return',lambda r:r[3].update(api='legacy')),
-        ('missing-completion-api',lambda r:r[4].pop('api')),
-        ('failed-required-report',lambda r:r[2].update(error=2)),
-        ('missing-settlement-status',lambda r:r[2].pop('error')),
-        ('boolean-settlement-status',lambda r:r[2].update(error=False)),
-        ('string-settlement-status',lambda r:r[2].update(error='0')),
+        ('legacy-return',lambda r:r[4].update(api='legacy')),
+        ('missing-completion-api',lambda r:r[5].pop('api')),
+        ('failed-required-report',lambda r:r[3].update(error=2)),
+        ('missing-settlement-status',lambda r:r[3].pop('error')),
+        ('boolean-settlement-status',lambda r:r[3].update(error=False)),
+        ('string-settlement-status',lambda r:r[3].update(error='0')),
     ]:
         changed=copy.deepcopy(fixture());mutate(changed)
         try: qualify_journal(changed,'sdk-required','host',123)
         except ValueError: controls.append(label)
         else: raise AssertionError('native gate accepted '+label)
-    duplicate=fixture()+[dict(row,pushID='host-1',sequence=row['sequence']+5,t_ms=row['t_ms']+5,
+    duplicate=fixture()+[dict(row,pushID='host-1',sequence=row['sequence']+6,t_ms=row['t_ms']+6,
                               error=2 if row['event']=='report.completed' else row['error']) for row in fixture()]
     qualify_journal(duplicate,'sdk-duplicate','host',123)
     optional=[dict(row,mustReport=False,reportEntered=False) for row in fixture()
-              if row['event'] not in ('report.incoming','report.completed')]
+              if row['event'] not in ('report.incoming','report.completed','push.reportDeadline')]
     for index,row in enumerate(optional): row['sequence']=index+1
     qualify_journal(optional,'optional','host',123)
-    for label,index,error in [('failed-first-duplicate',2,2),('successful-second-duplicate',7,0),
-                              ('boolean-second-duplicate',7,True)]:
+    for label,index,error in [('failed-first-duplicate',3,2),('successful-second-duplicate',9,0),
+                              ('boolean-second-duplicate',9,True)]:
         changed=copy.deepcopy(duplicate);changed[index]['error']=error
         try: qualify_journal(changed,'sdk-duplicate','host',123)
         except ValueError: controls.append(label)
@@ -355,7 +383,7 @@ def qualify_negative_journal(rows, mode, run_id, pid):
             'negative fixture did not use the required metadata path')
     require(returned.get('reportEntered') is False, 'negative return did not observe missing report')
     require(all(not str(row.get('event', '')).startswith('push.') or row.get('event') in
-                ('push.received', 'push.callbackReturned', 'push.completed') for row in rows),
+                ('push.received', 'push.reportDeadline', 'push.callbackReturned', 'push.completed') for row in rows),
             'unexpected push boundary event')
 
     reports = [row for row in rows if row.get('event') == 'report.incoming']
@@ -402,7 +430,7 @@ def negative_journal_controls():
         boundary = dict(push, api='metadata', mustReport=True)
         violation = dict(push, severity='error')
         report = dict(push, callUUID='E715ACF2-A7C1-4D74-8BD9-EAFA47693255')
-        events = [('push.received', boundary)]
+        events = [('push.received', boundary), ('push.reportDeadline', dict(push, seconds=4.4))]
         if mode == 'missing':
             events += [
                 ('push.completed', dict(boundary, reportEntered=False)),
@@ -481,6 +509,90 @@ def negative_journal_controls():
     return 'passed: synthetic missing/deferred negatives reproduced, normal rule remains red; '+str(len(positives))+' valid fixtures and '+str(len(negatives))+' malformed journal refusals ('+', '.join(row['control'] for row in negatives)+')'
 
 
+def push_deadline_references(profile):
+    def require(value, reason):
+        if not value: raise ValueError(reason)
+    evidence = profile['pushReportDeadlineEvidence']
+    seconds = profile['pushReportDeadlineSeconds']
+    reference = ROOT / evidence['reference']
+    text = reference.read_text()
+    require(f'{seconds:g} s' in text and '_terminateAppIfThereAreUnhandledVoIPPushes' in text, 'push deadline writeup differs')
+    references = {evidence['reference']: hashlib.sha256(reference.read_bytes()).hexdigest()}
+    captures = evidence['captures']
+    require(len(captures) == 2, 'expected surviving and terminated device captures')
+    for name, expected in captures.items():
+        path = ROOT / name
+        references[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        require(references[name] == expected, 'push deadline device trace differs')
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        received = next(row for row in rows if row['event'] == 'lckpush.received')
+        require(received['mustReport'] is True and received['strategy'] == 'deferred', 'device push policy differs')
+        starts = [row for row in rows if row['event'] == 'lckpush.reportStart']
+        if name.endswith('-3s.jsonl'):
+            require(len(starts) == 1 and starts[0]['afterMs'] < seconds * 1000, 'surviving report timing differs')
+            require(any(row['event'] == 'lckpush.alive' and row['t_ms'] - received['t_ms'] > seconds * 1000 for row in rows), 'surviving report lacks later liveness')
+        else:
+            require(name.endswith('-5s.jsonl') and not starts, 'late device trace contains a report')
+            last_alive = max(row['t_ms'] for row in rows if row['event'] == 'lckpush.alive') - received['t_ms']
+            require(4000 < last_alive < seconds * 1000 < 5000, 'raw late trace bound differs; no raw kill event is claimed')
+    return references
+
+
+def qualify_deadline_journal(rows, run_id, pid, profile):
+    def require(value, reason):
+        if not value: raise ValueError(reason)
+    require(type(pid) is int and pid > 0 and rows and all(type(row.get('pid')) is int and row['pid'] == pid and row.get('runID') == run_id and
+            row.get('bundleID') == 'dev.iosvoipsdk.pushentry' and row.get('profile') == profile['id'] for row in rows), 'deadline journal identity differs')
+    require([row.get('sequence') for row in rows] == list(range(1, len(rows) + 1)) and
+            all(type(row.get('t_ms')) is int and type(row.get('sequence')) is int for row in rows) and
+            all(a['t_ms'] <= b['t_ms'] for a, b in zip(rows, rows[1:])), 'deadline journal clock/sequence differs')
+    push_id = run_id + '-0'
+    def one(event):
+        found = [row for row in rows if row['event'] == event]
+        require(len(found) == 1 and found[0].get('pushID') == push_id, 'missing/repeated/foreign ' + event)
+        return found[0]
+    received, deadline, completed, returned, expired = (one(event) for event in
+        ('push.received', 'push.reportDeadline', 'push.completed', 'push.callbackReturned', 'diagnostic.pushReportExpired'))
+    require(received.get('api') == 'metadata' and all(row.get('mustReport') is True for row in (received, completed, returned)) and
+            all(row.get('reportEntered') is False for row in (completed, returned)), 'deadline required/completion policy differs')
+    seconds = profile['pushReportDeadlineSeconds']
+    require(received['sequence'] < deadline['sequence'] < completed['sequence'] < returned['sequence'] < expired['sequence'] and
+            deadline.get('seconds') == expired.get('seconds') == seconds and expired.get('severity') == 'error' and
+            type(expired.get('exitCode')) is int and expired['exitCode'] == 78, 'deadline event/exit policy differs')
+    elapsed = expired['t_ms'] - received['t_ms']
+    require(seconds * 1000 <= elapsed < 5000, 'deadline did not expire before the planned late report')
+    require(not any(row['event'] in ('report.incoming', 'report.completed') for row in rows), 'late native report escaped expiry')
+    return dict(case='late-report', expectedTerminated=True, reportDeadlineMS=seconds * 1000, observedExpiryMS=elapsed)
+
+
+def deadline_controls():
+    profile = json.loads((ROOT / 'Sources/Engine/Resources/ios-27.0.json').read_text())
+    push_deadline_references(profile)
+    events = [('push.received', dict(api='metadata', mustReport=True)),
+              ('push.reportDeadline', dict(seconds=4.4)),
+              ('push.completed', dict(mustReport=True, reportEntered=False)),
+              ('push.callbackReturned', dict(mustReport=True, reportEntered=False)),
+              ('diagnostic.pushReportExpired', dict(seconds=4.4, severity='error', exitCode=78))]
+    rows = [dict(event=event, sequence=i + 1, t_ms=(4401 if i == 4 else i), pid=123, runID='host',
+                 bundleID='dev.iosvoipsdk.pushentry', profile='ios-27.0', pushID='host-0', **fields)
+            for i, (event, fields) in enumerate(events)]
+    qualify_deadline_journal(rows, 'host', 123, profile)
+    cases = [('missing', lambda value: value.pop()),
+             ('foreign', lambda value: value[-1].update(pushID='other')),
+             ('early', lambda value: value[-1].update(t_ms=4399)),
+             ('late', lambda value: value[-1].update(t_ms=5000)),
+             ('wrong-profile', lambda value: value[-1].update(profile='other')),
+             ('exit', lambda value: value[-1].update(exitCode=0)),
+             ('completed-entry', lambda value: value[2].update(reportEntered=True)),
+             ('actual-report', lambda value: value.insert(1, dict(value[0], event='report.incoming')))]
+    for name, mutate in cases:
+        value = copy.deepcopy(rows); mutate(value)
+        try: qualify_deadline_journal(value, 'host', 123, profile)
+        except ValueError: pass
+        else: raise AssertionError('accepted malformed expiry ' + name)
+    return 'passed: deadline reference and journal positive plus ' + str(len(cases)) + ' refusals'
+
+
 def main():
     engine=(ROOT/'Sources/Engine/RuntimeEngine.swift').read_text()
     service=(ROOT/'Sources/VoIPSDK/PushService.swift').read_text()
@@ -494,7 +606,7 @@ def main():
     assert '@finally' in hook and 'CKSimEmit(@"push.callbackReturned"' in hook, 'runtime must record the actual callback exit'
     with tempfile.TemporaryDirectory(prefix='ios-voip-push-entry-') as temp:
         out=Path(temp)
-        results=[journal_controls(),negative_journal_controls(),compile_run(out,'policy',obligations+'\n'+POLICY),
+        results=[journal_controls(),negative_journal_controls(),deadline_controls(),compile_run(out,'policy',obligations+'\n'+POLICY),
                  compile_run(out,'pipeline',PIPELINE.replace('// EXACT_METHODS',receiver+'\n'+projection),
                              [ROOT/'Sources/VoIPSDK/ConversationModels.swift',ROOT/'Sources/VoIPSDK/PushWire.swift',
                               ROOT/'Sources/VoIPSDK/IncomingInvitationGate.swift',ROOT/'Sources/VoIPSDK/IncomingIntake.swift'])]

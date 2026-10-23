@@ -6,8 +6,8 @@ import Foundation
 final class IncomingIntake: @unchecked Sendable {
   enum IntakeError: Error, Sendable { case managerReset }
 
-  /// A platform result may precede another same-UUID attempt's success. Only that
-  /// duplicate ticket waits; its actual platform call must already have settled.
+  /// A failed platform result may precede another same-UUID attempt's success.
+  /// Public tickets may wait; actual report calls and native completion never do.
   enum ReportOutcome: Sendable {
     case reported
     case alreadyReported(any Error)
@@ -74,18 +74,21 @@ final class IncomingIntake: @unchecked Sendable {
     let terminal: Terminal?
   }
 
-  private struct DelayedDuplicate {
+  private struct SettledFailure {
     let ticket: Ticket
     let error: any Error
   }
   private final class Entry {
     let generation = UUID()
     let payload: IncomingCallPayload
+    // The first attempt's public result represents the canonical lifetime, not
+    // whichever duplicate report happens to settle first.
+    let canonicalTicket = Ticket()
     var attempts: [UUID: Attempt] = [:]
     // Reset fails public tickets, but it cannot cancel a framework async call.
     // Retain only its identity until actual settlement, without reviving it.
     var invalidatedAttempts: [UUID: UUID] = [:]
-    var delayedDuplicates: [DelayedDuplicate] = []
+    var settledFailures: [SettledFailure] = []
     var everReported = false
     var everObserved = false
     var resetInvalidated = false
@@ -97,7 +100,7 @@ final class IncomingIntake: @unchecked Sendable {
       self.payload = payload
       retainedUntil = now.addingTimeInterval(120)
     }
-    var hasPending: Bool { !attempts.isEmpty || !invalidatedAttempts.isEmpty || !delayedDuplicates.isEmpty }
+    var hasPending: Bool { !attempts.isEmpty || !invalidatedAttempts.isEmpty || !settledFailures.isEmpty }
     var ownershipKnown: Bool { everReported || everObserved }
   }
 
@@ -127,14 +130,10 @@ final class IncomingIntake: @unchecked Sendable {
 
     let disposition: Disposition
     if source == .foreground, existing != nil {
-      if let pending = entry.attempts.values.first?.ticket ?? entry.delayedDuplicates.first?.ticket {
-        disposition = .join(pending)
-      } else {
-        disposition = .reported
-      }
+      disposition = entry.ownershipKnown ? .reported : .join(entry.canonicalTicket)
     } else {
       let attempt = Attempt(id: registration.id, generation: entry.generation,
-        attemptID: UUID(), ticket: Ticket())
+        attemptID: UUID(), ticket: existing == nil ? entry.canonicalTicket : Ticket())
       entry.attempts[attempt.attemptID] = attempt
       // An ended UUID can be accepted again by LCK. Its original termination
       // must also apply to the newly reported platform conversation.
@@ -149,7 +148,7 @@ final class IncomingIntake: @unchecked Sendable {
   /// This method neither waits for MainActor nor invokes external code locked.
   func complete(_ attempt: Attempt, outcome: ReportOutcome, now: Date = Date()) {
     var resolutions: [(Ticket, Result<UUID, any Error>)] = []
-    var retiredDuplicates: [DelayedDuplicate] = []
+    var retiredFailures: [SettledFailure] = []
     lock.lock()
     if let entry = entries[attempt.id], entry.invalidatedAttempts[attempt.attemptID] == attempt.generation {
       entry.invalidatedAttempts.removeValue(forKey: attempt.attemptID)
@@ -166,13 +165,11 @@ final class IncomingIntake: @unchecked Sendable {
         entry.active = true
         invitations.markActive(attempt.id, serverCallId: entry.payload.serverCallId, now: now)
         resolutions.append((attempt.ticket, .success(attempt.id)))
-      case .alreadyReported(let error):
+      case .alreadyReported(let error), .failed(let error):
         if entry.ownershipKnown { resolutions.append((attempt.ticket, .success(attempt.id))) }
-        else { entry.delayedDuplicates.append(DelayedDuplicate(ticket: attempt.ticket, error: error)) }
-      case .failed(let error):
-        resolutions.append((attempt.ticket, .failure(error)))
+        else { entry.settledFailures.append(SettledFailure(ticket: attempt.ticket, error: error)) }
       }
-      resolveDuplicates(entry, id: attempt.id, into: &resolutions, retiring: &retiredDuplicates)
+      resolveTickets(entry, id: attempt.id, into: &resolutions, retiring: &retiredFailures)
       if entry.attempts.isEmpty && entry.invalidatedAttempts.isEmpty && !entry.ownershipKnown {
         // Every actual attempt has failed. A real retry gets a fresh UUID;
         // failures cannot erase another pending attempt or successful lifetime.
@@ -183,20 +180,21 @@ final class IncomingIntake: @unchecked Sendable {
     lock.unlock()
     // An external Error can run arbitrary code from deinit. Even successful
     // normalization must retain discarded errors until after the intake unlocks.
-    withExtendedLifetime((outcome, retiredDuplicates)) {}
+    withExtendedLifetime((outcome, retiredFailures)) {}
     for (ticket, result) in resolutions { ticket.resolve(result) }
   }
 
-  private func resolveDuplicates(_ entry: Entry, id: UUID,
-                                 into resolutions: inout [(Ticket, Result<UUID, any Error>)],
-                                 retiring retired: inout [DelayedDuplicate]) {
+  private func resolveTickets(_ entry: Entry, id: UUID,
+                              into resolutions: inout [(Ticket, Result<UUID, any Error>)],
+                              retiring retired: inout [SettledFailure]) {
     guard entry.ownershipKnown || entry.attempts.isEmpty else { return }
-    for duplicate in entry.delayedDuplicates {
-      resolutions.append((duplicate.ticket,
-        entry.ownershipKnown ? .success(id) : .failure(duplicate.error)))
+    if entry.ownershipKnown { resolutions.append((entry.canonicalTicket, .success(id))) }
+    for failure in entry.settledFailures {
+      resolutions.append((failure.ticket,
+        entry.ownershipKnown ? .success(id) : .failure(failure.error)))
     }
-    retired.append(contentsOf: entry.delayedDuplicates)
-    entry.delayedDuplicates.removeAll()
+    retired.append(contentsOf: entry.settledFailures)
+    entry.settledFailures.removeAll()
   }
 
   func projection(_ id: UUID) -> Projection? {
@@ -218,16 +216,16 @@ final class IncomingIntake: @unchecked Sendable {
   /// with their terminal marker, but must not reclaim discarded server aliases.
   func observeMembership(_ id: UUID, now: Date = Date()) {
     var resolutions: [(Ticket, Result<UUID, any Error>)] = []
-    var retiredDuplicates: [DelayedDuplicate] = []
+    var retiredFailures: [SettledFailure] = []
     lock.lock()
     if let entry = entries[id], !entry.resetInvalidated {
       entry.everObserved = true
       entry.active = true
       invitations.markActive(id, serverCallId: entry.payload.serverCallId, now: now)
-      resolveDuplicates(entry, id: id, into: &resolutions, retiring: &retiredDuplicates)
+      resolveTickets(entry, id: id, into: &resolutions, retiring: &retiredFailures)
     }
     lock.unlock()
-    withExtendedLifetime(retiredDuplicates) {}
+    withExtendedLifetime(retiredFailures) {}
     for (ticket, result) in resolutions { ticket.resolve(result) }
   }
 
@@ -299,8 +297,9 @@ final class IncomingIntake: @unchecked Sendable {
     retiredEntries = Array(entries.values)
     var retained: [UUID: Entry] = [:]
     for (id, entry) in entries {
+      tickets.append(entry.canonicalTicket)
       tickets.append(contentsOf: entry.attempts.values.map(\.ticket))
-      tickets.append(contentsOf: entry.delayedDuplicates.map(\.ticket))
+      tickets.append(contentsOf: entry.settledFailures.map(\.ticket))
       var invalidated = entry.invalidatedAttempts
       for attempt in entry.attempts.values { invalidated[attempt.attemptID] = attempt.generation }
       if entry.ownershipKnown {

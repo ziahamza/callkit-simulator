@@ -29,7 +29,7 @@ def bind_launcher_pid(result, matches):
 
 
 def run(launch, terminate, output, receipt, timeout, identity=None, console_launcher_stop=False,
-        inherit_launcher_group=False):
+        inherit_launcher_group=False, expected_app_exit=False):
     started = time.monotonic()
     result = {"completed": False, "success": False, "schemaVersion": 2, **(identity or {})}
     process = None
@@ -41,6 +41,8 @@ def run(launch, terminate, output, receipt, timeout, identity=None, console_laun
     bundle = result.get("bundleID")
     launcher_header = re.compile(rb"(?m)^" + re.escape(bundle.encode()) + rb": (\d+)\r?$") if bundle else None
     try:
+        if expected_app_exit and not console_launcher_stop:
+            raise RuntimeError("natural app exit requires the bound console launcher")
         if console_launcher_stop and not bundle:
             raise RuntimeError("console launcher stop requires a bound bundle ID")
         if inherit_launcher_group:
@@ -129,6 +131,7 @@ def run(launch, terminate, output, receipt, timeout, identity=None, console_laun
                     raise line
                 if line is None:
                     result["stdoutEOFSeconds"] = round(time.monotonic() - started, 3)
+                    if expected_app_exit: break
                     raise RuntimeError("launcher exited before terminal done event")
                 log.write(line)
                 log.flush()
@@ -138,6 +141,7 @@ def run(launch, terminate, output, receipt, timeout, identity=None, console_laun
                     except (ValueError, UnicodeDecodeError):
                         continue  # The conformance parser rejects malformed evidence.
                     if isinstance(row, dict) and row.get("event") == "done":
+                        if expected_app_exit: raise RuntimeError("expected app exit received terminal done event")
                         result["completed"] = True
                     if isinstance(row, dict):
                         result["lastProbeEvent"] = row.get("event")
@@ -147,85 +151,106 @@ def run(launch, terminate, output, receipt, timeout, identity=None, console_laun
                     if isinstance(row, dict) and row.get("event") == "launch" and type(row.get("pid")) is int:
                         result["appPID"] = row["pid"]
 
-            # SwiftUI intentionally stays alive after the scenario. A stop is
-            # accepted only after done and a successful termination of our app.
-            # simctl may flush its PID header only after termination; bind that
-            # identity after draining the launcher, before accepting success.
-            reply_terminal = []
-            if console_launcher_stop:
-                result["terminationMethod"] = "console-launcher-signal"
-                # Let an in-flight launcher reply arrive, without requiring it
-                # before stop: some launchers emit their header only after exit.
-                reply_deadline = min(deadline, time.monotonic() + 2)
-                have_reply = bool(launcher_header.search(output.read_bytes()))
-                while not have_reply:
-                    remaining = reply_deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    try:
-                        line = messages.get(timeout=remaining)
-                    except queue.Empty:
-                        break
-                    if line is None or isinstance(line, OSError):
-                        reply_terminal.append(line)
-                        break
-                    log.write(line)
-                    log.flush()
-                    have_reply = bool(launcher_header.search(line))
-                if process.poll() is not None:
-                    raise RuntimeError("console launcher exited before owned stop signal")
-                # simctl launch --console[-pty] documents forwarding received
-                # signals to its app. Signal only this invocation's Popen PID.
-                result["terminationSignal"] = signal.SIGTERM
-                os.kill(process.pid, signal.SIGTERM)
-                result["terminationSignalDelivered"] = True
-            else:
-                stop = subprocess.run(terminate, capture_output=True, timeout=20)
-                result["terminateExitCode"] = stop.returncode
-                if stop.returncode:
-                    raise RuntimeError("failed to terminate completed run-owned app")
-                stopped = True
-            try:
-                result["launchExitCode"] = process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                if console_launcher_stop:
-                    raise RuntimeError("console launcher did not exit after stop signal")
-                raise
-            if result["launchExitCode"] not in (0, -signal.SIGTERM, 128 + signal.SIGTERM):
-                raise RuntimeError(f"unexpected launcher exit: {result['launchExitCode']}")
-            drain_deadline = time.monotonic() + 5 if console_launcher_stop else None
-            while True:
-                remaining = drain_deadline - time.monotonic() if drain_deadline is not None else 5
-                if remaining <= 0:
-                    raise RuntimeError("launcher output did not close after stop")
-                try:
-                    line = reply_terminal.pop() if reply_terminal else messages.get(timeout=remaining)
-                except queue.Empty:
-                    raise RuntimeError("launcher output did not close after stop")
-                if isinstance(line, OSError):
-                    raise line
-                if line is None:
-                    break
-                log.write(line)
-            if console_launcher_stop:
-                log.flush()
+            if expected_app_exit:
+                result["expectedAppExit"] = True
+                result["terminationMethod"] = "natural-app-exit"
+                result["launchExitCode"] = process.wait(timeout=2)
+                # This is the launcher status, not an inferred simulator-app status.
+                if result["launchExitCode"] not in (0, 78):
+                    raise RuntimeError("unexpected natural-exit launcher status")
                 identity_error = bind_launcher_pid(result, launcher_header.findall(output.read_bytes()))
-                if identity_error:
-                    raise RuntimeError(identity_error)
-                result["appAbsenceMethod"] = "signal-zero"
-                result["appAbsentAfterStop"] = False
+                if identity_error: raise RuntimeError(identity_error)
                 absence_deadline = time.monotonic() + 2
                 while True:
-                    try:
-                        os.kill(result["appPID"], 0)
-                    except ProcessLookupError:
-                        result["appAbsentAfterStop"] = True
-                        break
+                    try: os.kill(result["appPID"], 0)
+                    except ProcessLookupError: break
                     if time.monotonic() >= absence_deadline:
-                        raise RuntimeError("run-owned app PID still exists after console stop")
+                        raise RuntimeError("run-owned app remains alive before natural-exit cleanup")
                     time.sleep(.02)
+                result["appAbsentBeforeCleanup"] = True
+                result["appAbsenceMethod"] = "signal-zero"
                 stopped = True
-            result["success"] = True
+                result["success"] = True
+            else:
+                # SwiftUI intentionally stays alive after the scenario. A stop is
+                # accepted only after done and a successful termination of our app.
+                # simctl may flush its PID header only after termination; bind that
+                # identity after draining the launcher, before accepting success.
+                reply_terminal = []
+                if console_launcher_stop:
+                    result["terminationMethod"] = "console-launcher-signal"
+                    # Let an in-flight launcher reply arrive, without requiring it
+                    # before stop: some launchers emit their header only after exit.
+                    reply_deadline = min(deadline, time.monotonic() + 2)
+                    have_reply = bool(launcher_header.search(output.read_bytes()))
+                    while not have_reply:
+                        remaining = reply_deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        try:
+                            line = messages.get(timeout=remaining)
+                        except queue.Empty:
+                            break
+                        if line is None or isinstance(line, OSError):
+                            reply_terminal.append(line)
+                            break
+                        log.write(line)
+                        log.flush()
+                        have_reply = bool(launcher_header.search(line))
+                    if process.poll() is not None:
+                        raise RuntimeError("console launcher exited before owned stop signal")
+                    # simctl launch --console[-pty] documents forwarding received
+                    # signals to its app. Signal only this invocation's Popen PID.
+                    result["terminationSignal"] = signal.SIGTERM
+                    os.kill(process.pid, signal.SIGTERM)
+                    result["terminationSignalDelivered"] = True
+                else:
+                    stop = subprocess.run(terminate, capture_output=True, timeout=20)
+                    result["terminateExitCode"] = stop.returncode
+                    if stop.returncode:
+                        raise RuntimeError("failed to terminate completed run-owned app")
+                    stopped = True
+                try:
+                    result["launchExitCode"] = process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    if console_launcher_stop:
+                        raise RuntimeError("console launcher did not exit after stop signal")
+                    raise
+                if result["launchExitCode"] not in (0, -signal.SIGTERM, 128 + signal.SIGTERM):
+                    raise RuntimeError(f"unexpected launcher exit: {result['launchExitCode']}")
+                drain_deadline = time.monotonic() + 5 if console_launcher_stop else None
+                while True:
+                    remaining = drain_deadline - time.monotonic() if drain_deadline is not None else 5
+                    if remaining <= 0:
+                        raise RuntimeError("launcher output did not close after stop")
+                    try:
+                        line = reply_terminal.pop() if reply_terminal else messages.get(timeout=remaining)
+                    except queue.Empty:
+                        raise RuntimeError("launcher output did not close after stop")
+                    if isinstance(line, OSError):
+                        raise line
+                    if line is None:
+                        break
+                    log.write(line)
+                if console_launcher_stop:
+                    log.flush()
+                    identity_error = bind_launcher_pid(result, launcher_header.findall(output.read_bytes()))
+                    if identity_error:
+                        raise RuntimeError(identity_error)
+                    result["appAbsenceMethod"] = "signal-zero"
+                    result["appAbsentAfterStop"] = False
+                    absence_deadline = time.monotonic() + 2
+                    while True:
+                        try:
+                            os.kill(result["appPID"], 0)
+                        except ProcessLookupError:
+                            result["appAbsentAfterStop"] = True
+                            break
+                        if time.monotonic() >= absence_deadline:
+                            raise RuntimeError("run-owned app PID still exists after console stop")
+                        time.sleep(.02)
+                    stopped = True
+                result["success"] = True
     except (OSError, RuntimeError, subprocess.TimeoutExpired, queue.Empty) as error:
         result["error"] = str(error)
     finally:

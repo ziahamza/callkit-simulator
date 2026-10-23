@@ -51,6 +51,15 @@ invalidation. The shared RFC token type includes `fcm`; this iOS module produces
 private revision envelope. Reports return `Promise<void>` so native failures are
 observable. No v1 API is retained.
 
+`useAudioRoutes()` returns immutable `{ routes, current }` snapshots; `current`
+is the actual OS output with an `output:<UID>` id, port name and raw port type,
+or `null` when no output is observed. `input:<UID>` choices and `speaker` are
+selection targets, not a complete output inventory or proof of receiver
+availability. `selectAudioRoute(id)` requests an available input or speaker
+override while system audio is active; selecting the already-current output id
+is a no-op. Published state follows the subsequent OS read, including after a
+failed request, rather than assuming that the requested route became current.
+
 ## Private native contract
 
 The exact typed contract is `src/internal/protocol.ts`. All listeners attach

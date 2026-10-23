@@ -10,7 +10,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
-MODES = ('reported', 'joined-success', 'joined-failure')
+MODES = ('reported', 'joined-success', 'joined-sibling-success', 'joined-failure')
 PLATFORM_GUARD = '#if canImport(LiveCommunicationKit) && (os(iOS) || os(watchOS))'
 INPUTS = [
     'Sources/VoIPSDK/ConversationClient.swift',
@@ -23,6 +23,11 @@ INPUTS = [
     'Sources/VoIPSDK/PushWire.swift',
     'Sources/VoIPSDK/SimulatorSupport.swift',
     'Sources/VoIPSDK/ProcessSDKOwnership.swift',
+    'Sources/VoIPSDK/AudioActivation.swift',
+    'Sources/VoIPSDK/AudioRoutes.swift',
+    'Sources/VoIPSDK/AudioAdapterOperations.swift',
+    'Sources/VoIPSDK/AudioSessionQueue.swift',
+    'Sources/VoIPSDK/MediaAdapter.swift',
     'Sources/VoIPPlatform/VSProcessSDKOwnership.m',
     'Sources/VoIPPlatform/include/VSProcessSDKOwnership.h',
     'Tests/VoIPSDK/IncomingCachePlatform.swift',
@@ -67,8 +72,12 @@ def run(out):
         for filename in ('ConversationClient.swift', 'IncomingReportTransport.swift'):
             source = sources['Sources/VoIPSDK/' + filename].decode()
             (out / filename).write_text(host_boundary(source, audio=filename == 'ConversationClient.swift'))
+        adapter = sources['Sources/VoIPSDK/MediaAdapter.swift'].decode()
+        adapter_guard = '#if canImport(AVFAudio) && (os(iOS) || os(watchOS))'
+        assert adapter.count(adapter_guard) == adapter.count('import AVFAudio') == 1
+        (out / 'MediaAdapter.swift').write_text(adapter.replace(adapter_guard, '#if true', 1).replace('import AVFAudio', '', 1))
         compile_inputs = [str(ROOT / name) for name in INPUTS if name.endswith('.swift') and not
-                          name.endswith(('/ConversationClient.swift', '/IncomingReportTransport.swift'))]
+                          name.endswith(('/ConversationClient.swift', '/IncomingReportTransport.swift', '/MediaAdapter.swift'))]
         # Ownership uses Foundation only, so compile the real gate rather than
         # adding another modeled process-claim implementation to the facade.
         owner_object = out / 'VSProcessSDKOwnership.o'
@@ -81,7 +90,7 @@ def run(out):
             '-parse-as-library', '-import-objc-header',
             str(ROOT / 'Sources/VoIPPlatform/include/VSProcessSDKOwnership.h'),
             *compile_inputs, str(out / 'ConversationClient.swift'),
-            str(out / 'IncomingReportTransport.swift'), str(owner_object),
+            str(out / 'IncomingReportTransport.swift'), str(out / 'MediaAdapter.swift'), str(owner_object),
             '-o', str(out / 'IncomingCacheTests')], 90)
         if code != 0:
             raise RuntimeError('whole-client cache compile failed: ' + str(code) + '; ' + stderr.decode(errors='replace'))

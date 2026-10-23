@@ -5,9 +5,11 @@ import {
   reportIncomingConversation,
   setConversationHandler,
   setHeld,
+  useAudioRoutes,
   useConversationEvent,
   useConversations,
   usePushToken,
+  type ConversationEventMap,
 } from 'ios-voip-sdk';
 import { bootstrap, type BootstrapInfo } from 'ios-voip-sdk/internal/bootstrap';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -35,6 +37,7 @@ import {
   runSystemAcceptance,
   systemTrace,
 } from './system-acceptance';
+import { observeMediaEvent, runMediaAcceptance } from './media';
 
 type Status =
   | { phase: 'loading' }
@@ -57,12 +60,18 @@ function StatusRow({ label, value }: { label: string; value: string }) {
 function CallingJourney() {
   const conversations = useConversations();
   const pushToken = usePushToken();
+  const audioRoutes = useAudioRoutes();
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('Ready for an example call.');
+  const [dialRequest, setDialRequest] = useState<
+    ConversationEventMap['dialRequest'] | null
+  >(null);
   const automated =
     journey().acceptanceEnabled ||
     journey().m1Case !== '' ||
-    journey().systemCase !== '';
+    journey().systemCase !== '' ||
+    journey().m2Case !== '' ||
+    journey().m3Enabled;
   const conversation = conversations[0];
 
   useEffect(() => {
@@ -78,18 +87,40 @@ function CallingJourney() {
   useEffect(() => {
     if (journey().m1Case !== '') observeToken(pushToken);
   }, [pushToken]);
-  const observeEvent = (name: string) => {
+  const observeEvent = (name: string, conversationID?: string) => {
     if (journey().m1Case !== '') void trace('m1.event', { name });
     if (journey().systemCase !== '') void systemTrace('system.event', { name });
+    if (journey().m2Case !== '') observeMediaEvent(name, conversationID);
   };
   useConversationEvent('audioActivated', () => observeEvent('audioActivated'));
   useConversationEvent('audioDeactivated', () =>
     observeEvent('audioDeactivated'),
   );
+  useConversationEvent('audioActivationMissing', ({ conversationId }) =>
+    observeEvent('audioActivationMissing', conversationId),
+  );
+  useConversationEvent('audioActivationFailed', ({ conversationId }) =>
+    observeEvent('audioActivationFailed', conversationId),
+  );
   useConversationEvent('providerReset', () => observeEvent('providerReset'));
   useConversationEvent('pushTokenUpdated', () =>
     observeEvent('pushTokenUpdated'),
   );
+  useConversationEvent('dialRequest', (request) => {
+    setDialRequest(request);
+    if (journey().m3Enabled) {
+      void journey().observedDialRequest(request.handle, request.video);
+    }
+  });
+  useEffect(() => {
+    // This effect follows the hook's subscription effect. Readiness never
+    // substitutes for observing the public event itself.
+    if (journey().m3Enabled) {
+      void journey().dialListenerReady().then(() => {
+        if (journey().m3DirectEnabled) return journey().deliverDirectDialRequests();
+      });
+    }
+  }, []);
 
   const command = async (operation: () => Promise<unknown>) => {
     setBusy(true);
@@ -135,6 +166,18 @@ function CallingJourney() {
       <StatusRow
         label="Push token"
         value={pushToken === null ? 'Not registered' : 'Registered'}
+      />
+      <StatusRow
+        label="Dial request"
+        value={
+          dialRequest
+            ? `${dialRequest.handle} (${dialRequest.video ? 'video' : 'audio'})`
+            : 'No dial request'
+        }
+      />
+      <StatusRow
+        label="Audio route"
+        value={audioRoutes.current?.name ?? 'No observed output'}
       />
       <Text style={styles.body} accessibilityLiveRegion="polite">
         {message}
@@ -205,11 +248,15 @@ export default function App() {
         !acceptanceStarted.current &&
         (journey().acceptanceEnabled ||
           journey().m1Case !== '' ||
-          journey().systemCase !== '')
+          journey().systemCase !== '' ||
+          journey().m2Case !== '')
       ) {
         acceptanceStarted.current = true;
         setAcceptanceMessage('Running simulator acceptance…');
-        if (journey().acceptanceEnabled) {
+        if (journey().m2Case !== '') {
+          setStatus({ phase: 'ready', info });
+          await runMediaAcceptance();
+        } else if (journey().acceptanceEnabled) {
           setStatus({ phase: 'ready', info });
           await journey().acceptance();
         } else if (journey().systemCase !== '') {
@@ -232,7 +279,11 @@ export default function App() {
       }
     } catch (error) {
       try {
-        if (journey().m1Case !== '' || journey().systemCase !== '')
+        if (
+          journey().m1Case !== '' ||
+          journey().systemCase !== '' ||
+          journey().m2Case !== ''
+        )
           await journey().finish(false);
       } catch {
         // Preserve the screen's native-module loading error if no fixture exists.

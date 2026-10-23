@@ -634,8 +634,57 @@ def controls():
     checks.extend(container_cache_controls())
     checks.extend(cleanup_controls())
     checks.extend(supervisor_controls())
+    checks.extend(runner_environment_controls())
     return checks
 
 
+def runner_environment_controls():
+    import run_sdk_system as runner
+
+    class LaunchBoundary(Exception):
+        pass
+
+    launches = []
+    def launch(_command, **options):
+        launches.append(options['env'])
+        raise LaunchBoundary
+
+    with tempfile.TemporaryDirectory(prefix='sdk-system-launch-controls-') as temporary:
+        journey = runner.Journey.__new__(runner.Journey)
+        journey.args = SimpleNamespace(run_id='synthetic-system-run', simulator='synthetic-simulator')
+        journey.root = Path(temporary)
+        journey.case = 'answer-end'
+        journey.name = 'sdk-system-answer-end'
+        journey.trace = journey.root / 'trace.log'
+        with patch.dict(os.environ, {'SIMCTL_CHILD_SDK_M3_ACCEPTANCE': '1',
+              'SIMCTL_CHILD_SDK_M3_RUN_ID': 'stale-direct-run',
+              'SIMCTL_CHILD_SDK_M3_DELIVERY': 'direct-url-and-intent',
+              'SIMCTL_CHILD_SDK_M2_RUN_ID': 'stale-media-run',
+              'SIMCTL_CHILD_SDK_M2_CASE': 'stale-audio',
+              'SIMCTL_CHILD_DYLD_INSERT_LIBRARIES': '/synthetic/inherited.dylib',
+              'SDK_SYSTEM_UNRELATED_CONTROL': 'preserved'}), \
+             patch.object(runner.subprocess, 'Popen', side_effect=launch), \
+             patch.object(runner.subprocess, 'run', side_effect=AssertionError('native command forbidden')):
+            try:
+                journey.run()
+            except LaunchBoundary:
+                pass
+        require = gate.require
+        require(len(launches) == 1, 'system launch boundary not reached exactly once')
+        env = launches[0]
+        require(not any(key.startswith('SIMCTL_CHILD_SDK_M3_') for key in env),
+                'system launch inherited M3 mode or run identity')
+        require('SIMCTL_CHILD_SDK_M2_RUN_ID' not in env, 'system launch inherited M2 run identity')
+        require(env['SIMCTL_CHILD_SDK_SYSTEM_RUN_ID'] == 'synthetic-system-run' and
+                env['SIMCTL_CHILD_CKSIM_RUN_ID'] == 'synthetic-system-run' and
+                env['SIMCTL_CHILD_SDK_SYSTEM_CASE'] == 'answer-end', 'system launch identity differs')
+        require(env['SIMCTL_CHILD_SDK_M0_ACCEPTANCE'] == '0' and env['SIMCTL_CHILD_SDK_M1_CASE'] == '' and
+                env['SIMCTL_CHILD_SDK_M2_CASE'] == '', 'system launch enabled another journey')
+        require(env['SIMCTL_CHILD_DYLD_INSERT_LIBRARIES'] == '/synthetic/inherited.dylib' and
+                env['SDK_SYSTEM_UNRELATED_CONTROL'] == 'preserved', 'system launch changed unrelated environment')
+    return [dict(name='system-runner-isolates-M3-child-environment', passed=True,
+                 expected='actual launcher environment isolated; subprocess boundary mocked')]
+
+
 if __name__ == '__main__':
-    print(json.dumps(dict(success=True, measurement='measured synthetic logical-gate controls only', checks=controls()), indent=2))
+    print(json.dumps(dict(success=True, measurement='measured synthetic logical-gate and mocked launch-boundary controls only', checks=controls()), indent=2))

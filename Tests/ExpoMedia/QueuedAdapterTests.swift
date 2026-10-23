@@ -1,0 +1,90 @@
+import AVFAudio
+import Dispatch
+import Foundation
+import os
+import VoIPPlatform
+
+// Inert binding boundary: run the real Swift wrapper's closures on the real
+// common queue. The separate ObjC controls exercise each production binding.
+final class VSSelectedMediaBinding: Sendable {
+  static let fixture = VSSelectedMediaBinding()
+  private let calls = OSAllocatedUnfairLock(initialState: 0)
+  static func shared() -> VSSelectedMediaBinding { fixture }
+  var prepareCalls: Int { calls.withLock { $0 } }
+  func setSystemAudioAuthorization(_ active: Bool) {}
+  func prepare(check: @escaping @Sendable () -> NSError?,
+               configuration: @escaping @Sendable () -> NSError?,
+               completion: @escaping @Sendable (Error?) -> Void) {
+    calls.withLock { $0 += 1 }
+    VSAudioSessionGetQueue().async {
+      precondition(VSAudioSessionIsOnQueue() && !Thread.isMainThread)
+      if let error = check() { completion(error); return }
+      completion(configuration())
+    }
+  }
+  func activate(_ session: AVAudioSession, completion: @escaping @Sendable (Error?) -> Void) {
+    VSAudioSessionGetQueue().async { completion(nil) }
+  }
+  func deactivate(_ session: AVAudioSession, completion: @escaping @Sendable (Error?) -> Void) {
+    VSAudioSessionGetQueue().async { completion(nil) }
+  }
+}
+enum ExpoMediaSelection { static let name = "webrtc" }
+private enum Failure: Error { case assertion(String) }
+
+@main struct QueuedAdapterTests {
+  @MainActor static func expect(_ value: @autoclosure () -> Bool, _ message: String) throws {
+    if !value() { throw Failure.assertion(message) }
+  }
+  @MainActor static func main() async throws {
+    guard CommandLine.arguments.count == 2 else { throw Failure.assertion("Expected one scenario") }
+    let adapter = QueuedMediaAdapter()
+    let audio = AVAudioSession.fixture, binding = VSSelectedMediaBinding.fixture
+    try expect(audio.configurationCalls == 0 && binding.prepareCalls == 0, "Construction must not prepare audio")
+    try await adapter.prepare()
+    try expect(audio.configurationCalls == 0 && binding.prepareCalls == 1,
+      "Manual preparation before the handler must leave category and mode untouched")
+    switch CommandLine.arguments[1] {
+    case "phase-order":
+      try await adapter.prepareForFulfillment()
+      try expect(audio.configurationCalls == 1 && binding.prepareCalls == 2,
+        "Fulfillment preparation must execute the actual session configuration closure")
+      try await adapter.prepare()
+      try expect(audio.configurationCalls == 1, "A later handler's manual preparation must not reconfigure")
+      try await adapter.prepareForFulfillment()
+      try expect(audio.configurationCalls == 2 && binding.prepareCalls == 4,
+        "Each accepted action configures only during its fulfillment preparation")
+    case "configuration-failure":
+      audio.rejectNextConfiguration()
+      var failure: NSError?
+      do { try await adapter.prepareForFulfillment() } catch { failure = error as NSError }
+      let expected = AVAudioSession.FixtureError.configurationRejected as NSError
+      try expect(failure?.domain == expected.domain && failure?.code == expected.code && audio.configurationCalls == 1,
+        "Final configuration failure must cross the actual wrapper's completion boundary")
+    case "queued-cancellation":
+      let entered = AsyncStream<Void>.makeStream()
+      let release = DispatchSemaphore(value: 0)
+      defer { release.signal(); entered.continuation.finish() }
+      VSAudioSessionGetQueue().async {
+        entered.continuation.yield(())
+        precondition(release.wait(timeout: .now() + 3) == .success)
+      }
+      for await _ in entered.stream { break }
+      let task = Task { @MainActor in
+        try await AudioPreparationScope.perform { try await adapter.prepareForFulfillment() }
+      }
+      let limit = ContinuousClock.now + .seconds(2)
+      while binding.prepareCalls < 2 {
+        precondition(ContinuousClock.now < limit, "Final configuration did not queue")
+        await Task.yield()
+      }
+      task.cancel(); release.signal()
+      var failed = false
+      do { try await task.value } catch { failed = true }
+      try expect(failed && audio.configurationCalls == 0,
+        "An action cancelled while queued must never enter session configuration")
+    default: throw Failure.assertion("Unknown scenario")
+    }
+    print("passed: \(CommandLine.arguments[1]); actual Swift QueuedMediaAdapter with inert binding/AV boundaries")
+  }
+}

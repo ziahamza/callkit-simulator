@@ -52,6 +52,7 @@ def main():
         'Sources/VoIPSDK/VoIPApplication.swift', 'Sources/VoIPSDK/ConversationClient.swift',
         'Sources/VoIPSDK/ConversationModels.swift', 'Sources/VoIPSDK/ProcessSDKOwnership.swift',
         'Package.swift', 'IosVoipSDK.podspec', 'package.json', 'VERSION',
+        'Sources/VoIPSDK/AudioActivation.swift',
         'discovery/check_sdk_ownership.py')]
     before = {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
     with tempfile.TemporaryDirectory(prefix='voip-process-ownership-') as temporary:
@@ -65,10 +66,14 @@ def main():
         assert not re.search(r'public\s+(?:static\s+)?(?:var shared|func configure\()', client), 'only Application may publish/create the client'
         configuration = client[client.index('  public struct Configuration:'):client.index('  private static var instance')]
         selection = client[client.index('  private static var instance:'):client.index('  private typealias Record')]
-        finish = client[client.index('  func finishLaunch() {'):client.index('  @discardableResult\n  public func observeState')]
+        finish = client[client.index('  func finishLaunch() {'):client.index('  private func configureAudio()')]
         events = client[client.index('  @discardableResult\n  public func observeEvents'):client.index('  public func setConversationHandler')]
-        emit = next(line for line in client.splitlines() if line.startswith('  private func emit(_ event: ConversationEvent)'))
+        emit_start = client.index('  private func emit(_ event: ConversationEvent,')
+        emit = client[emit_start:client.index('\n  }', emit_start) + 4]
+        activation = (ROOT / 'Sources/VoIPSDK/AudioActivation.swift').read_text()
+        policy = activation[activation.index('public struct AudioActivationPolicy:'):activation.index('enum AudioActivationEvent:')]
         (out / 'Facades.swift').write_text('''import Foundation
+''' + policy + '''
 // Explicit platform facade: a coverage diagnostic is not a provider conflict.
 @MainActor enum ProviderCreationMonitor {
   static var conflict: (@MainActor () -> Void)?
@@ -79,18 +84,35 @@ def main():
     installs += 1; coverageDiagnostics += 1; diagnostic("host facade: coverage unavailable")
   }
 }
+@MainActor public protocol MediaAdapter: AnyObject {
+  func setSystemAudioAuthorization(_ active: Bool)
+}
+@MainActor public final class NoMediaAdapter: MediaAdapter {
+  public init() {}
+  public func setSystemAudioAuthorization(_ active: Bool) {}
+}
+@MainActor final class RecordingMediaAdapter: MediaAdapter {
+  var authorizations: [Bool] = []
+  var onAuthorization: (@MainActor (Bool) -> Void)?
+  func setSystemAudioAuthorization(_ active: Bool) {
+    authorizations.append(active); onAuthorization?(active)
+  }
+}
 @MainActor public final class ConversationClient {
 ''' + configuration + selection + '''
   static var creations = 0
   static var tracks = 0
   static var onTrack: (@MainActor () -> Void)?
   private let configuration: Configuration
+  private let mediaAdapter: any MediaAdapter
+  private let audioPolicy: AudioActivationPolicy
   private var launchFinished = false
-  private var eventObservers: [UUID: @MainActor (ConversationEvent) -> Void] = [:]
-  private init(configuration: Configuration) {
-    self.configuration = configuration
+  private var eventObservers: [UUID: @MainActor (ConversationEventContext) -> Void] = [:]
+  private init(configuration: Configuration, mediaAdapter: any MediaAdapter, audioPolicy: AudioActivationPolicy) {
+    self.configuration = configuration; self.mediaAdapter = mediaAdapter; self.audioPolicy = audioPolicy
     Self.creations += 1 // Explicit facade for constructing the LCK manager.
   }
+  var selectedAdapterForHost: any MediaAdapter { mediaAdapter }
   private func trackManager() { // Explicit facade for observing LCK state.
     Self.tracks += 1; Self.onTrack?()
   }
@@ -135,20 +157,52 @@ def main():
           ProviderCreationMonitor.installs == 0 else { return false }
     let configuration = VoIPApplication.Configuration(client: .init(
       supportsVideo: false, providerOwnershipMonitoring: true))
+    let adapter = RecordingMediaAdapter()
     var reentered = false
+    var authorizationReentered = false
     ConversationClient.onTrack = {
       guard let published = VoIPApplication.current else { return }
       do {
-        let repeated = try VoIPApplication.start(configuration: configuration)
-        let publishedClient = try ConversationClient.forApplication(configuration: configuration.client)
+        let repeated = try VoIPApplication.start(configuration: configuration, mediaAdapter: adapter)
+        let publishedClient = try ConversationClient.forApplication(configuration: configuration.client, mediaAdapter: adapter)
         reentered = repeated === published && repeated.client === publishedClient &&
           repeated.client === published.client && ConversationClient.creations == 1
       } catch {}
     }
-    let application = try VoIPApplication.start(configuration: configuration)
-    guard reentered, application === VoIPApplication.current,
+    adapter.onAuthorization = { active in
+      guard !active, let published = VoIPApplication.current else { return }
+      do {
+        let repeated = try VoIPApplication.start(configuration: configuration, mediaAdapter: adapter)
+        authorizationReentered = repeated === published && repeated.client === published.client
+      } catch {}
+    }
+    let application = try VoIPApplication.start(configuration: configuration, mediaAdapter: adapter)
+    guard reentered, authorizationReentered, application === VoIPApplication.current,
+          application.client.selectedAdapterForHost === adapter, adapter.authorizations == [false],
           ConversationClient.creations == 1, ConversationClient.tracks == 1,
-          try VoIPApplication.start(configuration: configuration) === application else { return false }
+          try VoIPApplication.start(configuration: configuration) === application,
+          try VoIPApplication.start(configuration: configuration, mediaAdapter: adapter) === application,
+          adapter.authorizations == [false] else { return false }
+    let conflictingAdapter = RecordingMediaAdapter()
+    do {
+      _ = try VoIPApplication.start(configuration: configuration, mediaAdapter: conflictingAdapter)
+      return false
+    } catch {
+      guard (error as? ConversationClientError) == .alreadyConfigured else { return false }
+    }
+    do {
+      _ = try ConversationClient.forApplication(configuration: configuration.client, mediaAdapter: conflictingAdapter)
+      return false
+    } catch {
+      guard (error as? ConversationClientError) == .alreadyConfigured else { return false }
+    }
+    do {
+      _ = try VoIPApplication.start(configuration: configuration, mediaAdapter: adapter,
+        audioPolicy: AudioActivationPolicy(activationTimeout: 12, recoveryTimeout: 6))
+      return false
+    } catch {
+      guard (error as? ConversationClientError) == .alreadyConfigured else { return false }
+    }
     var changedClient = configuration; changedClient.client.supportsVideo.toggle()
     var changedApplication = configuration; changedApplication.simulatorSupport.toggle()
     // Reach the production client guard directly: Application rejects its own
@@ -166,8 +220,9 @@ def main():
       }
     }
     guard ConversationClient.creations == 1 && ConversationClient.tracks == 1,
-          ProviderCreationMonitor.installs == 1 else { return false }
-    var events: [ConversationEvent] = []
+          ProviderCreationMonitor.installs == 1, conflictingAdapter.authorizations.isEmpty,
+          adapter.authorizations == [false] else { return false }
+    var events: [ConversationEventContext] = []
     let observer = application.client.observeEvents { events.append($0) }
     // These are the actual finishLaunch closure and actual observe/emit methods.
     // Interception/coverage itself remains the explicit platform facade above.
@@ -175,10 +230,10 @@ def main():
     guard events.isEmpty, ProviderCreationMonitor.coverageDiagnostics == 2,
           let conflict = ProviderCreationMonitor.conflict else { return false }
     conflict()
-    guard events == [.providerOwnershipLost] else { return false }
+    guard events == [.init(type: .providerOwnershipLost)] else { return false }
     application.client.removeEventObserver(observer)
     conflict()
-    return events == [.providerOwnershipLost] && ConversationClient.creations == 1 &&
+    return events == [.init(type: .providerOwnershipLost)] && ConversationClient.creations == 1 &&
       ConversationClient.tracks == 1
   } catch { return false }
 }
@@ -196,6 +251,7 @@ public func claimOnly() -> Bool {
         models = (ROOT / 'Sources/VoIPSDK/ConversationModels.swift').read_text()
         selected_models = '\n'.join(re.findall(r'public enum (?:UnhandledActionPolicy|ConversationClientError|ConversationEvent)[^{]+\{.*?\}', models, re.S))
         assert selected_models.count('public enum ') == 3
+        selected_models += '\n' + models[models.index('public struct ConversationEventContext:'):]
         claim = ROOT / 'Sources/VoIPSDK/ProcessSDKOwnership.swift'
         combined = out / 'SDK.swift'
         combined.write_text('import Foundation\n' + selected_models + '\n' +
@@ -263,6 +319,8 @@ import ExpoPodSDK
                                   'actual-forApplication-rejects-invalid-first-configurations-before-manager',
                                   'actual-forApplication-rejects-changed-configuration-before-second-manager',
                                   'actual-Application-rejects-client-and-simulator-configuration-conflicts',
+                                  'omitted-repeat-adapter-preserves-selection-and-conflicting-adapter-refuses',
+                                  'actual-finishLaunch-reentrant-authorization-sees-published-owner-exactly-once',
                                   'actual-finishLaunch-reentrant-observation-sees-published-application-and-client',
                                   'actual-finishLaunch-observes-exactly-once-for-both-linked-module-orders',
                                   'release-monitor-default-does-not-install',

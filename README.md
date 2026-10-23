@@ -15,6 +15,7 @@ The API design is [RFC 0001](https://github.com/ziahamza/expo-callkit-telecom/pu
 ## Requirements
 
 - iOS and iPadOS 17.4 or later.
+- Build the Swift package and Expo module with the iOS 27 SDK or newer (CI uses Xcode 27.1). One binary handles legacy interruptions on 17.4–26 and the new lifecycle notifications on 27+. The standalone simulator runtime retains its earlier compiler lanes.
 - Mac Catalyst waits for an Apple SDK fix: with Xcode 27.1, `ConversationManagerDelegate` conformances fail to link on Catalyst.
 - Apple Watch is deferred.
 

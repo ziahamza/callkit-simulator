@@ -134,6 +134,18 @@ export interface PushToken {
   value: string;
 }
 
+export interface AudioRoute {
+  readonly id: string;
+  readonly name: string;
+  /** AVAudioSession's raw port type value on iOS. */
+  readonly type: string;
+}
+
+export interface AudioRoutes {
+  readonly routes: readonly AudioRoute[];
+  readonly current: AudioRoute | null;
+}
+
 /** M2 supplies watchdog signals; M3 supplies dial requests. */
 export interface ConversationEventMap {
   audioActivated: { conversationId?: string };

@@ -6,26 +6,38 @@ import Foundation
 final class ConversationClient {
   private(set) var handler: ConversationHandler?
   private var states: [UUID: @MainActor (ConversationStateUpdate) -> Void] = [:]
-  private var events: [UUID: @MainActor (ConversationEvent) -> Void] = [:]
+  private var events: [UUID: @MainActor (ConversationEventContext) -> Void] = [:]
+  private var routes: [UUID: @MainActor (AudioRoutesSnapshot) -> Void] = [:]
   var state = ConversationStateUpdate(revision: 0, conversations: [])
+  var audioRoutes = AudioRoutesSnapshot(revision: 0, routes: [], current: nil)
   var stateObserverCount: Int { states.count }
   var eventObserverCount: Int { events.count }
+  var audioRoutesObserverCount: Int { routes.count }
 
   func setConversationHandler(_ handler: ConversationHandler?) { self.handler = handler }
   func observeState(_ callback: @escaping @MainActor (ConversationStateUpdate) -> Void) -> UUID {
     let id = UUID(); states[id] = callback; callback(state); return id
   }
   func removeStateObserver(_ id: UUID) { states.removeValue(forKey: id) }
-  func observeEvents(_ callback: @escaping @MainActor (ConversationEvent) -> Void) -> UUID {
+  func observeEvents(_ callback: @escaping @MainActor (ConversationEventContext) -> Void) -> UUID {
     let id = UUID(); events[id] = callback; return id
   }
   func removeEventObserver(_ id: UUID) { events.removeValue(forKey: id) }
+  func observeAudioRoutes(_ callback: @escaping @MainActor (AudioRoutesSnapshot) -> Void) -> UUID {
+    let id = UUID(); routes[id] = callback; callback(audioRoutes); return id
+  }
+  func removeAudioRoutesObserver(_ id: UUID) { routes.removeValue(forKey: id) }
+  func publish(_ update: AudioRoutesSnapshot) {
+    audioRoutes = update
+    for callback in Array(routes.values) { callback(update) }
+  }
   func publish(_ update: ConversationStateUpdate) {
     state = update
     for callback in Array(states.values) { callback(update) }
   }
-  func publish(_ event: ConversationEvent) {
-    for callback in Array(events.values) { callback(event) }
+  func publish(_ event: ConversationEvent, conversationID: UUID? = nil) {
+    let context = ConversationEventContext(type: event, conversationID: conversationID)
+    for callback in Array(events.values) { callback(context) }
   }
 }
 
@@ -51,4 +63,9 @@ final class VoIPApplication {
     guard let fixture else { throw BridgeError.unavailable }
     return fixture
   }
+}
+
+@MainActor
+enum ExpoMediaSupport {
+  static func startFromBundle() throws -> VoIPApplication { try VoIPApplication.startFromBundle() }
 }

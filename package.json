@@ -22,6 +22,7 @@
     "build",
     "Expo/apple",
     "Expo/plugin",
+    "ExpoMedia",
     "app.plugin.js",
     "Sources",
     "profiles",

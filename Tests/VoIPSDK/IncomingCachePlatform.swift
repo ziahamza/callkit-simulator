@@ -1,5 +1,36 @@
 import Foundation
 import Observation
+import Dispatch
+
+// Inert host audio-session boundary; the production queue and adapter ordering remain real.
+private let hostAudioQueue = DispatchQueue(label: "VoIPSDK.HostAudioBoundary")
+func VSAudioSessionGetQueue() -> DispatchQueue { hostAudioQueue }
+
+extension AudioSessionQueue {
+  public func configureForConversation() throws { try Self.checkCancellation() }
+}
+
+enum SystemAudioLifecycleEvent: Sendable {
+  case active, inactive(source: Int?, interruptionReason: UInt?), mediaServicesReset, resumptionRecommended(Bool)
+}
+
+@MainActor final class SystemAudioSession {
+  static var latest: SystemAudioSession?
+  let routes = AudioRoutesStore()
+  var onLifecycle: (@MainActor (SystemAudioLifecycleEvent) -> Void)?
+  private(set) var authorized = false
+  init() { Self.latest = self }
+  func setSystemAudioAuthorization(_ active: Bool) { authorized = active }
+  func refreshRoutes() {}
+  func selectRoute(_ id: String, isActive: Bool) async throws { _ = try routes.selection(id, isActive: isActive) }
+  func deliver(_ event: SystemAudioLifecycleEvent) {
+    switch event {
+    case .inactive, .mediaServicesReset: authorized = false
+    case .active, .resumptionRecommended: break
+    }
+    onLifecycle?(event)
+  }
+}
 
 // Test-only LCK boundary. The production client and handler remain unchanged.
 public struct Handle: Hashable, Sendable {
