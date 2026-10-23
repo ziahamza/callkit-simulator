@@ -14,7 +14,10 @@ TEST = ROOT / 'Tests/ExpoMedia'
 def queued_adapter_controls(out, sdk):
     target = platform.machine() + '-apple-macos14.0'
     (out / 'module.modulemap').write_text('module VoIPPlatform { header "' +
-        str(ROOT / 'Sources/VoIPPlatform/include/VSAudioSessionQueue.h') + '" export * }\n')
+        str(ROOT / 'Sources/VoIPPlatform/include/VSAudioSessionQueue.h') + '" export * }\n' +
+        'module VSMediaInterop { header "' + str(TEST / 'QueuedCallbackBoundary.h') + '" export * }\n')
+    headers = [str(TEST / 'Facades'), str(ROOT / 'ExpoMedia/Shared'),
+               str(ROOT / 'Sources/VoIPPlatform/include')]
     adapted = []
     for name in ('MediaAdapter.swift', 'AudioSessionConfiguration.swift'):
         source = (ROOT / 'Sources/VoIPSDK' / name).read_text()
@@ -24,14 +27,19 @@ def queued_adapter_controls(out, sdk):
     commands = [
         ['xcrun', 'clang', '-isysroot', sdk, '-target', target, '-fobjc-arc', '-fmodules', '-c',
          str(ROOT / 'Sources/VoIPPlatform/VSAudioSessionQueue.m'), '-o', str(out / 'Queue.o')],
+        ['xcrun', 'clang', '-isysroot', sdk, '-target', target, '-fobjc-arc', '-fmodules',
+         *['-I' + path for path in headers], '-c', str(TEST / 'QueuedCallbackBoundary.m'),
+         '-o', str(out / 'Callback.o')],
         ['xcrun', 'swiftc', '-target', target, '-swift-version', '6', '-warnings-as-errors', '-parse-as-library',
          '-I', str(out), '-c', '-emit-module', '-module-name', 'AVFAudio',
          str(ROOT / 'Tests/AudioCore/AudioSessionFacade.swift'), '-emit-module-path', str(out / 'AVFAudio.swiftmodule'),
          '-o', str(out / 'AVFAudio.o')],
         ['xcrun', 'swiftc', '-target', target, '-swift-version', '6', '-warnings-as-errors', '-parse-as-library',
-         '-I', str(out), *adapted, str(ROOT / 'Sources/VoIPSDK/AudioSessionQueue.swift'),
+         '-I', str(out), *[flag for path in headers for flag in ('-Xcc', '-I' + path)],
+         *adapted, str(ROOT / 'Sources/VoIPSDK/AudioSessionQueue.swift'),
          str(ROOT / 'ExpoMedia/Shared/QueuedMediaAdapter.swift'), str(TEST / 'QueuedAdapterTests.swift'),
-         str(out / 'AVFAudio.o'), str(out / 'Queue.o'), '-framework', 'Foundation', '-o', str(out / 'queued-adapter')],
+         str(out / 'AVFAudio.o'), str(out / 'Queue.o'), str(out / 'Callback.o'),
+         '-framework', 'Foundation', '-o', str(out / 'queued-adapter')],
     ]
     for command in commands:
         built = subprocess.run(command, capture_output=True, text=True, timeout=90)
@@ -40,7 +48,7 @@ def queued_adapter_controls(out, sdk):
     for name in ('phase-order', 'configuration-failure', 'queued-cancellation'):
         result = subprocess.run([str(out / 'queued-adapter'), name], capture_output=True, text=True, timeout=10)
         if result.returncode or not result.stdout.startswith('passed:') or 'SWIFT TASK CONTINUATION MISUSE' in result.stderr:
-            raise RuntimeError('Swift queued adapter controls failed:\n' + result.stdout + result.stderr)
+            raise RuntimeError(f'Swift queued adapter {name} controls failed (exit {result.returncode}):\n' + result.stdout + result.stderr)
         results.append(result.stdout.strip())
     return dict(success=True, results=results)
 

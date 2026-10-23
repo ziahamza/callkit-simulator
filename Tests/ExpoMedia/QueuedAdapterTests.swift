@@ -3,29 +3,18 @@ import Dispatch
 import Foundation
 import os
 import VoIPPlatform
+import VSMediaInterop
 
-// Inert binding boundary: run the real Swift wrapper's closures on the real
-// common queue. The separate ObjC controls exercise each production binding.
-final class VSSelectedMediaBinding: Sendable {
-  static let fixture = VSSelectedMediaBinding()
-  private let calls = OSAllocatedUnfairLock(initialState: 0)
-  static func shared() -> VSSelectedMediaBinding { fixture }
-  var prepareCalls: Int { calls.withLock { $0 } }
-  func setSystemAudioAuthorization(_ active: Bool) {}
-  func prepare(check: @escaping @Sendable () -> NSError?,
-               configuration: @escaping @Sendable () -> NSError?,
-               completion: @escaping @Sendable (Error?) -> Void) {
-    calls.withLock { $0 += 1 }
-    VSAudioSessionGetQueue().async {
-      precondition(VSAudioSessionIsOnQueue() && !Thread.isMainThread)
-      if let error = check() { completion(error); return }
-      completion(configuration())
-    }
-  }
-  func activate(_ session: AVAudioSession, completion: @escaping @Sendable (Error?) -> Void) {
+// The actual imported production interface supplies preparation's callback
+// context. Only AVFAudio arguments remain inert Swift host facades.
+typealias VSSelectedMediaBinding = VSMediaInterop.VSSelectedMediaBinding
+extension VSSelectedMediaBinding {
+  static var fixture: VSSelectedMediaBinding { shared() }
+  var prepareCalls: Int { Int(VSHostMediaPreparationCount()) }
+  func activate(_ session: AVFAudio.AVAudioSession, completion: @escaping @Sendable (Error?) -> Void) {
     VSAudioSessionGetQueue().async { completion(nil) }
   }
-  func deactivate(_ session: AVAudioSession, completion: @escaping @Sendable (Error?) -> Void) {
+  func deactivate(_ session: AVFAudio.AVAudioSession, completion: @escaping @Sendable (Error?) -> Void) {
     VSAudioSessionGetQueue().async { completion(nil) }
   }
 }
@@ -39,7 +28,7 @@ private enum Failure: Error { case assertion(String) }
   @MainActor static func main() async throws {
     guard CommandLine.arguments.count == 2 else { throw Failure.assertion("Expected one scenario") }
     let adapter = QueuedMediaAdapter()
-    let audio = AVAudioSession.fixture, binding = VSSelectedMediaBinding.fixture
+    let audio = AVFAudio.AVAudioSession.fixture, binding = VSSelectedMediaBinding.fixture
     try expect(audio.configurationCalls == 0 && binding.prepareCalls == 0, "Construction must not prepare audio")
     try await adapter.prepare()
     try expect(audio.configurationCalls == 0 && binding.prepareCalls == 1,
@@ -58,7 +47,7 @@ private enum Failure: Error { case assertion(String) }
       audio.rejectNextConfiguration()
       var failure: NSError?
       do { try await adapter.prepareForFulfillment() } catch { failure = error as NSError }
-      let expected = AVAudioSession.FixtureError.configurationRejected as NSError
+      let expected = AVFAudio.AVAudioSession.FixtureError.configurationRejected as NSError
       try expect(failure?.domain == expected.domain && failure?.code == expected.code && audio.configurationCalls == 1,
         "Final configuration failure must cross the actual wrapper's completion boundary")
     case "queued-cancellation":

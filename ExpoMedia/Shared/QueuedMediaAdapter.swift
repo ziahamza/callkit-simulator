@@ -18,10 +18,10 @@ final class QueuedMediaAdapter: MediaAdapter {
     while true {
       try AudioSessionQueue.checkCancellation()
       do {
-        try await complete { binding.prepare(check: {
+        try await complete { binding.prepare(check: { @Sendable in
           do { try permit?.check(); return nil }
           catch { return error as NSError }
-        }, configuration: {
+        }, configuration: { @Sendable in
           do {
             try permit?.check()
             if configureSession { try AudioSessionConfiguration.applyOnAudioQueue(permit: permit) }
