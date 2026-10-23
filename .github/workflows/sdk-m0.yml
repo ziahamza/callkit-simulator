@@ -180,20 +180,26 @@ jobs:
           bash Tests/AudioSessionQueue/run.sh | tee "$SDK_M0_BUILD_LOGS/audio-queue-controls.log"
           bash Tests/AudioCore/run.sh | tee "$SDK_M0_BUILD_LOGS/audio-watchdog-controls.log"
           python3 Tests/AudioLifecycle/check_audio_lifecycle.py | tee "$SDK_M0_BUILD_LOGS/audio-lifecycle-controls.log"
-          python3 Tests/AudioLifecycle/check_audio_fixtures.py | tee "$SDK_M0_BUILD_LOGS/audio-raw-fixtures.log"
+          python3 Tests/AudioLifecycle/check_audio_fixtures.py 2>&1 | tee "$SDK_M0_BUILD_LOGS/audio-raw-fixtures.log"
           python3 Tests/AudioRoutes/run.py | tee "$SDK_M0_BUILD_LOGS/audio-route-controls.log"
           python3 discovery/check_expo_media.py | tee "$SDK_M0_BUILD_LOGS/webrtc-facade-controls.log"
           python3 discovery/check_expo_media_config.py | tee "$SDK_M0_BUILD_LOGS/media-selection-controls.log"
-          python3 Tests/ExpoMedia/check_standard_backend.py | tee "$SDK_M0_BUILD_LOGS/standard-backend-gate-controls.log"
+          python3 Tests/ExpoMedia/check_standard_backend.py 2>&1 | tee "$SDK_M0_BUILD_LOGS/standard-backend-gate-controls.log"
           bash Tests/AudioCore/run_livekit.sh | tee "$SDK_M0_BUILD_LOGS/swift-livekit-adapter-controls.log"
           python3 discovery/check_audio_contract_cleanup.py 2>&1 | tee "$SDK_M0_BUILD_LOGS/audio-contract-cleanup-controls.log"
-          python3 discovery/check_sdk_m2_audio_lifecycle.py | tee "$SDK_M0_BUILD_LOGS/audio-lifecycle-capture-controls.log"
+          python3 discovery/check_sdk_m2_audio_lifecycle.py 2>&1 | tee "$SDK_M0_BUILD_LOGS/audio-lifecycle-capture-controls.log"
           bash Tests/VoIPSDK/run_push.sh | tee "$SDK_M0_BUILD_LOGS/push-controls.log"
           bash Tests/VoIPSDK/run_projection.sh | tee "$SDK_M0_BUILD_LOGS/projection-controls.log"
           bash Tests/VoIPSDK/run_mute_echo.sh | tee "$SDK_M0_BUILD_LOGS/mute-echo-controls.json"
           bash Tests/ProbeTraceWriter/run.sh | tee "$SDK_M0_BUILD_LOGS/probe-writer-controls.json"
           for script in discovery/build_sdk_bootstrap.sh discovery/build_sdk_device_probe.sh discovery/build_sdk_m1_contracts.sh discovery/build_push_report_entry.sh discovery/run_sdk_m0.sh discovery/run_audio_lifecycle_legacy.sh; do
             bash -n "$script"
+          done
+          for offline_log in "$SDK_M0_BUILD_LOGS"/*; do
+            if [[ -f "$offline_log" && ! -s "$offline_log" ]]; then
+              printf 'Empty offline build log: %s\n' "${offline_log##*/}" >&2
+              exit 1
+            fi
           done
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
