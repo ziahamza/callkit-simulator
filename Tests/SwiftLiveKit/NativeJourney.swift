@@ -160,7 +160,9 @@ private struct EngineState: Sendable {
       .appendingPathComponent(".callkit-simulator")
       .appendingPathComponent(ProcessInfo.processInfo.environment["CKSIM_RUN_ID"] ?? "")
       .appendingPathComponent("responses")
-    let stop = ContinuousClock.now + .seconds(15)
+    // Before any call/action/watchdog: allow the bounded 60s external notifier
+    // plus its 10s ACK wait to finish on a cold simulator host.
+    let stop = ContinuousClock.now + .seconds(75)
     while ContinuousClock.now < stop {
       for path in (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {
         guard path.pathExtension == "json", let data = try? Data(contentsOf: path),
