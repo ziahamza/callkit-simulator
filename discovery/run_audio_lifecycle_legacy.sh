@@ -119,7 +119,7 @@ if [[ -n "${SIMCTL_CHILD_DYLD_INSERT_LIBRARIES+x}" ]]; then
   INHERITED_DYLD=$SIMCTL_CHILD_DYLD_INSERT_LIBRARIES
 else
   query_status=0
-  INHERITED_DYLD=$(limit 60 env -u SIMCTL_CHILD_DYLD_INSERT_LIBRARIES xcrun simctl spawn "$UDID" launchctl getenv DYLD_INSERT_LIBRARIES 2> "$OUT/launch-environment-query.log") || query_status=$?
+  INHERITED_DYLD=$(SIMCTL_CHILD_DYLD_INSERT_LIBRARIES='' limit 180 xcrun simctl spawn "$UDID" launchctl getenv DYLD_INSERT_LIBRARIES 2> "$OUT/launch-environment-query.log") || query_status=$?
   printf 'Query exit code: %s\n' "$query_status" >> "$OUT/launch-environment-query.log"
   [[ "$query_status" -le 1 ]] || { echo 'Cannot read inherited launch environment' >&2; exit 1; }
 fi

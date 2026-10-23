@@ -86,9 +86,10 @@ def main():
 
     def read_dyld(label):
         result = sim(label, 'spawn', simulator, 'launchctl', 'getenv', 'DYLD_INSERT_LIBRARIES',
-                     env={**control_env, 'SIMCTL_CHILD_DYLD_INSERT_LIBRARIES': ''})
-        if result.stderr: raise RuntimeError('Cannot read simulator launch environment')
-        return None if not result.stdout else result.stdout.removesuffix(b'\n')
+                     timeout=180, env={**control_env, 'SIMCTL_CHILD_DYLD_INSERT_LIBRARIES': ''}, check=False)
+        if result.returncode not in (0, 1) or result.stderr or (result.returncode == 1 and result.stdout):
+            raise RuntimeError('Cannot read simulator launch environment')
+        return None if result.returncode == 1 else result.stdout.removesuffix(b'\n')
 
     def wait_for(predicate, seconds, message):
         deadline = time.monotonic() + seconds
@@ -266,7 +267,7 @@ def main():
             removals = []
             for udid in owned:
                 removal = dict(simulatorID=udid, deleted=False, absentFromInventory=False)
-                try: sim('shutdown', 'shutdown', udid, timeout=30, check=False)
+                try: sim('shutdown', 'shutdown', udid, timeout=60, check=False)
                 except Exception: pass
                 try:
                     deleted = sim('delete', 'delete', udid, timeout=60, check=False)

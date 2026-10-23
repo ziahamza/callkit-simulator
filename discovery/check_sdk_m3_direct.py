@@ -114,7 +114,8 @@ def fixture(root):
 
 class Controls(unittest.TestCase):
     def run_capture(self, *, omit_receipt=False, terminate_during_boot=False,
-                    dyld_status=0, dyld=b'', create_timeout=False, create_invalid=False, supervisor_mode='normal'):
+                    dyld_status=0, dyld=b'', dyld_stderr=b'', final_dyld=None,
+                    launch_dyld='/private/fixture-injector.dylib', create_timeout=False, create_invalid=False, supervisor_mode='normal'):
         with tempfile.TemporaryDirectory(prefix='sdk-m3-direct-runner-controls-') as directory:
             root = Path(directory); app = root / 'Original.app'; app.mkdir()
             data = root / 'data'; data.mkdir(); (data / 'tmp').mkdir(); out = root / 'capture'
@@ -131,11 +132,11 @@ class Controls(unittest.TestCase):
                        'Info.plist': gate.m0.digest(app / 'Info.plist')},
                 buildLogs={'build.log': gate.m0.digest(root / 'build.log')}))
             simulator = '00000000-0000-4000-8000-000000000001'
-            calls, launches, group_calls, waits = [], [], [], []
+            calls, launches, group_calls, waits, queries = [], [], [], [], []
             device_state = dict(name=None, deleted=False)
 
             def external(argv, **kwargs):
-                calls.append(argv); output = b''; status = 0
+                calls.append(argv); output = b''; status = 0; stderr = b''
                 if argv[:3] in (['xcrun', 'simctl', 'create'], ['xcrun', 'simctl', 'boot']):
                     self.assertFalse(any(key.startswith(('SIMCTL_CHILD_SDK_M3_', 'SIMCTL_CHILD_SDK_M1_', 'SIMCTL_CHILD_SDK_SYSTEM_')) for key in kwargs['env']))
                 if terminate_during_boot and argv[:3] == ['xcrun', 'simctl', 'boot']:
@@ -158,7 +159,10 @@ class Controls(unittest.TestCase):
                 elif argv[:3] == ['xcrun', 'simctl', 'spawn']:
                     self.assertEqual(argv[4:7], ['launchctl', 'getenv', 'DYLD_INSERT_LIBRARIES'])
                     self.assertEqual(kwargs['env']['SIMCTL_CHILD_DYLD_INSERT_LIBRARIES'], '')
-                    output, status = dyld, dyld_status
+                    self.assertEqual(kwargs['timeout'], 180)
+                    values = final_dyld if queries and final_dyld is not None else (dyld_status, dyld, dyld_stderr)
+                    queries.append(values)
+                    status, output, stderr = values
                 elif argv[:3] == ['xcrun', 'simctl', 'get_app_container']:
                     output = str(out / 'example.app' if argv[-1] == 'app' else data).encode()
                 elif argv == ['xcodebuild', '-version']: output = b'Xcode fixture'
@@ -167,7 +171,8 @@ class Controls(unittest.TestCase):
                     raise AssertionError('Unexpected external command: ' + repr(argv))
                 if argv[:3] in (['xcrun', 'simctl', 'terminate'], ['xcrun', 'simctl', 'shutdown'], ['xcrun', 'simctl', 'delete']):
                     for sig in (signal.SIGTERM, signal.SIGINT): self.assertIs(signal.getsignal(sig), signal.SIG_IGN)
-                return subprocess.CompletedProcess(argv, status, output, b'')
+                if argv[:3] == ['xcrun', 'simctl', 'shutdown']: self.assertEqual(kwargs['timeout'], 60)
+                return subprocess.CompletedProcess(argv, status, output, stderr)
 
             class Supervisor:
                 def __init__(self, argv, **kwargs):
@@ -211,6 +216,10 @@ class Controls(unittest.TestCase):
                 if sig == signal.SIGKILL: device_state['supervisor'].status = -9
                 elif sig == 0 and supervisor_mode != 'remaining-group': raise ProcessLookupError
 
+            environment = dict(os.environ, SIMCTL_CHILD_SDK_M3_RUN_ID='stale-boot-run',
+                SIMCTL_CHILD_SDK_M1_CASE='stale-case', SIMCTL_CHILD_SDK_SYSTEM_CASE='stale-system')
+            environment.pop('SIMCTL_CHILD_DYLD_INSERT_LIBRARIES', None)
+            if launch_dyld is not None: environment['SIMCTL_CHILD_DYLD_INSERT_LIBRARIES'] = launch_dyld
             captured = io.StringIO()
             handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
             registered = handlers.copy()
@@ -228,9 +237,7 @@ class Controls(unittest.TestCase):
                  patch.object(runner.time, 'sleep', side_effect=lambda _: None), \
                  patch.object(sys, 'argv', ['run_sdk_m3_direct.py', '--app', str(app),
                     '--build-receipt', str(receipt), '--out', str(out)]), \
-                 patch.dict(os.environ, {'SIMCTL_CHILD_DYLD_INSERT_LIBRARIES': '/private/fixture-injector.dylib',
-                    'SIMCTL_CHILD_SDK_M3_RUN_ID': 'stale-boot-run', 'SIMCTL_CHILD_SDK_M1_CASE': 'stale-case',
-                    'SIMCTL_CHILD_SDK_SYSTEM_CASE': 'stale-system'}), contextlib.redirect_stdout(captured):
+                 patch.dict(os.environ, environment, clear=True), contextlib.redirect_stdout(captured):
                 status = runner.main()
             self.assertEqual(handlers, {sig: signal.getsignal(sig) for sig in handlers})
             self.assertEqual(handlers, registered)
@@ -246,8 +253,12 @@ class Controls(unittest.TestCase):
                 self.assertEqual(cleanup['recoveredSimulators'], [simulator])
                 self.assertTrue(cleanup['recoveredCleanup'][0]['absentFromInventory'])
                 self.assertFalse(launches)
+            if dyld_status not in (0, 1) or dyld_stderr or (dyld_status == 1 and dyld):
+                self.assertFalse(launches, 'Invalid launch-environment query must fail before app launch')
             if launches:
-                self.assertEqual(launches[0]['SIMCTL_CHILD_DYLD_INSERT_LIBRARIES'], '/private/fixture-injector.dylib')
+                expected_dyld = launch_dyld if launch_dyld is not None else dyld.removesuffix(b'\n').decode()
+                self.assertEqual(launches[0]['SIMCTL_CHILD_DYLD_INSERT_LIBRARIES'], expected_dyld)
+                self.assertEqual(len(queries), 2)
                 self.assertNotEqual(launches[0]['SIMCTL_CHILD_SDK_M3_RUN_ID'], 'stale-boot-run')
                 self.assertEqual(launches[0]['SIMCTL_CHILD_SDK_M3_DELIVERY'], 'direct-url-and-intent')
             self.assertFalse((out / 'settings').exists())
@@ -326,6 +337,54 @@ import Foundation
         result, summary = self.run_capture()
         self.assertEqual(result, 0, summary)
         self.assertEqual(summary['publicDialRequests'], 2)
+
+    def test_cold_launch_queries_preserve_unset_empty_raw_bytes_and_override(self):
+        for status, value in ((1, b''), (0, b''), (0, b'/private/observed.dylib\n'),
+                              (0, b'/private/observed.dylib\n\n')):
+            with self.subTest(status=status, value=value):
+                result, summary = self.run_capture(dyld_status=status, dyld=value, launch_dyld=None)
+                self.assertEqual(result, 0, summary)
+        result, summary = self.run_capture(dyld=b'/private/observed.dylib\n')
+        self.assertEqual(result, 0, summary)
+
+    def test_launch_query_diagnostics_and_unknown_status_refuse_without_launch(self):
+        for status, value, stderr in ((2, b'', b''), (-15, b'', b''), (142, b'', b''),
+                                      (1, b'unexpected', b''), (0, b'', b'diagnostic'), (1, b'', b'diagnostic')):
+            with self.subTest(status=status, value=value, stderr=stderr):
+                result, summary = self.run_capture(dyld_status=status, dyld=value, dyld_stderr=stderr)
+                self.assertEqual(result, 1, summary)
+                self.assertEqual(summary['failure']['reason'], 'Cannot read simulator launch environment')
+
+    def test_legacy_and_duo_query_uses_empty_observer_and_preserves_override(self):
+        source = Path(__file__).with_name('run_audio_lifecycle_legacy.sh').read_text()
+        start = source.index('if [[ -n "${SIMCTL_CHILD_DYLD_INSERT_LIBRARIES+x}" ]]')
+        query = source[start:source.index('SDK_AUDIO_EXTERNAL_DYLD=', start)]
+        stub = '''set -euo pipefail
+UDID=owned
+limit() {
+  [[ "$*" == '180 xcrun simctl spawn owned launchctl getenv DYLD_INSERT_LIBRARIES' &&
+     "${SIMCTL_CHILD_DYLD_INSERT_LIBRARIES+x}" == x && -z "$SIMCTL_CHILD_DYLD_INSERT_LIBRARIES" ]] || return 99
+  printf 'query\n' >> "$OUT/queries"
+  printf '/private/observed.dylib\n'
+}
+'''
+        for override in (None, '/private/caller.dylib'):
+            with self.subTest(override=override), tempfile.TemporaryDirectory(prefix='sdk-audio-query-') as directory:
+                environment = dict(os.environ, OUT=directory)
+                environment.pop('SIMCTL_CHILD_DYLD_INSERT_LIBRARIES', None)
+                if override is not None: environment['SIMCTL_CHILD_DYLD_INSERT_LIBRARIES'] = override
+                result = subprocess.run(['/bin/bash', '-c', stub + query + 'printf "%s" "$INHERITED_DYLD"'],
+                    env=environment, capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, override if override is not None else '/private/observed.dylib')
+                self.assertEqual((Path(directory) / 'queries').exists(), override is None)
+
+    def test_unset_and_explicit_empty_remain_distinct_during_cleanup(self):
+        for status in (0, 1):
+            with self.subTest(initial_status=status):
+                result, summary = self.run_capture(dyld_status=status, final_dyld=(1 - status, b'', b''))
+                self.assertEqual(result, 1, summary)
+                self.assertEqual(summary['failure']['reason'], 'Simulator launch environment changed during M3')
 
     def test_direct_runner_missing_receipt_stays_red_and_cleans(self):
         result, summary = self.run_capture(omit_receipt=True)
