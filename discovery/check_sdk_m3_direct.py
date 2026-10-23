@@ -115,7 +115,8 @@ def fixture(root):
 class Controls(unittest.TestCase):
     def run_capture(self, *, omit_receipt=False, terminate_during_boot=False,
                     dyld_status=0, dyld=b'', dyld_stderr=b'', final_dyld=None,
-                    launch_dyld='/private/fixture-injector.dylib', create_timeout=False, create_invalid=False, supervisor_mode='normal'):
+                    launch_dyld='/private/fixture-injector.dylib', create_timeout=False, create_invalid=False,
+                    supervisor_mode='normal', host_metadata_requires_idle=False):
         with tempfile.TemporaryDirectory(prefix='sdk-m3-direct-runner-controls-') as directory:
             root = Path(directory); app = root / 'Original.app'; app.mkdir()
             data = root / 'data'; data.mkdir(); (data / 'tmp').mkdir(); out = root / 'capture'
@@ -165,7 +166,10 @@ class Controls(unittest.TestCase):
                     status, output, stderr = values
                 elif argv[:3] == ['xcrun', 'simctl', 'get_app_container']:
                     output = str(out / 'example.app' if argv[-1] == 'app' else data).encode()
-                elif argv == ['xcodebuild', '-version']: output = b'Xcode fixture'
+                elif argv == ['xcodebuild', '-version']:
+                    if host_metadata_requires_idle and device_state['name'] is not None:
+                        raise subprocess.TimeoutExpired(argv, kwargs['timeout'])
+                    output = b'Xcode fixture'
                 elif argv[:3] not in (['xcrun', 'simctl', 'boot'], ['xcrun', 'simctl', 'bootstatus'],
                         ['xcrun', 'simctl', 'install'], ['xcrun', 'simctl', 'shutdown'], ['xcrun', 'simctl', 'terminate']):
                     raise AssertionError('Unexpected external command: ' + repr(argv))
@@ -262,6 +266,9 @@ class Controls(unittest.TestCase):
                 self.assertNotEqual(launches[0]['SIMCTL_CHILD_SDK_M3_RUN_ID'], 'stale-boot-run')
                 self.assertEqual(launches[0]['SIMCTL_CHILD_SDK_M3_DELIVERY'], 'direct-url-and-intent')
             self.assertFalse((out / 'settings').exists())
+            if host_metadata_requires_idle:
+                self.assertLess(calls.index(['xcodebuild', '-version']),
+                    next(index for index, argv in enumerate(calls) if argv[:3] == ['xcrun', 'simctl', 'create']))
             if launches:
                 if supervisor_mode != 'unowned': self.assertIn((SUPERVISOR, 0), group_calls)
                 self.assertEqual((SUPERVISOR, signal.SIGKILL) in group_calls, supervisor_mode == 'timeout-live')
@@ -337,6 +344,10 @@ import Foundation
         result, summary = self.run_capture()
         self.assertEqual(result, 0, summary)
         self.assertEqual(summary['publicDialRequests'], 2)
+
+    def test_host_metadata_precedes_simulator_load(self):
+        result, summary = self.run_capture(host_metadata_requires_idle=True)
+        self.assertEqual(result, 0, summary)
 
     def test_cold_launch_queries_preserve_unset_empty_raw_bytes_and_override(self):
         for status, value in ((1, b''), (0, b''), (0, b'/private/observed.dylib\n'),

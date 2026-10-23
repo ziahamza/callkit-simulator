@@ -132,6 +132,8 @@ def main():
             shutil.copyfile(path, out / 'build-logs' / name)
         # Preserve original app bytes; there is deliberately no post-build signing.
         acceptance_gate.check_input_build(app, build, identity)
+        # Host metadata is independent of the DUT; collect it before simulator load.
+        xcode_version = command('xcode-version', ['xcodebuild', '-version']).stdout.decode().strip()
         runtimes = json.loads(command('runtimes', ['xcrun', 'simctl', 'list', 'runtimes', '-j']).stdout)['runtimes']
         available = [r for r in runtimes if r.get('platform') == 'iOS' and r.get('isAvailable') and
                      (not args.runtime or r.get('identifier') == args.runtime)]
@@ -162,7 +164,7 @@ def main():
             raise RuntimeError('M3 refuses external SDK runtime injection')
         environment = dict(simulatorID=simulator, simulatorRuntimeID=runtime['identifier'],
                            simulatorOS=runtime['version'], simulatorBuild=runtime['buildversion'],
-                           xcodeVersion=command('xcode-version', ['xcodebuild', '-version']).stdout.decode().strip())
+                           xcodeVersion=xcode_version)
         write(out / 'environment.json', environment)
         manifest['environmentSHA256'] = m0.digest(out / 'environment.json')
         sim('install', 'install', simulator, str(copied), timeout=180)
