@@ -2,8 +2,25 @@ import ExpoModulesCore
 import Foundation
 import Dispatch
 
-@ExpoModule("Expo2Spike")
+@ExpoModule("Expo2Spike", classes: [PingProbe.self])
 public final class Expo2SpikeModule: Module {
+  @JS func rawAsync(_ callback: @escaping @Sendable (Double) async throws -> Double) async throws -> Double {
+    try await callback(handlerNow()) // Bounded resolve/throw probes only: never/reload use HandlerCell.
+  }
+  @JS func rawBlocking(_ callback: @escaping @Sendable (Double) throws -> Double) async throws -> ClosureProbe {
+    let cell = HandlerCell<ClosureProbe>(), runtime = try appContext!.runtime
+    DispatchQueue(label: "expo2.spike.blocking-callback").async {
+      let before = captureThread("blocking-native-before", runtime: runtime), start = handlerNow()
+      let jsEnd = (try? callback(start)) ?? -1
+      cell.finish(ClosureProbe(times: [start, jsEnd, handlerNow()], threads: [before,
+        captureThread("blocking-native-after", runtime: runtime)], counts: []))
+    }
+    var result = await cell.wait(); result.counts = cell.stats
+    return result
+  }
+
+  @JS var startupReceipt: StartupReceipt { StartupLedger.shared.snapshot() }
+
   private let handlerRuntimeID = UUID().uuidString
   @Event var onHandler: (HandlerWire) -> Void
   @JS var handlerSnapshot: HandlerSnapshot { HandlerLedger.shared.snapshot(handlerRuntimeID) }

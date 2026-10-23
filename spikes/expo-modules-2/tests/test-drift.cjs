@@ -16,13 +16,16 @@ function run(source) {
 try {
   const baseline = run(original);
   assert.equal(baseline.status, 0, baseline.stderr);
-  for (const [name, source] of [
+  const mutations = [
     ['removed method', original.replace(/  publish\(version: number\): void;\n/, '')],
     ['parameter type', original.replace('publish(version: number)', 'publish(version: string)')],
     ['record field', original.replace('connectedAt: number', 'connectedAt: string')],
     ['module base', original.replace('extends NativeModule<Events>', 'extends DriftBase<Events>') +
       "\nimport { SharedObject as DriftBase } from 'expo-modules-core';\n"],
-  ]) {
+  ];
+  if (original.includes('class PingProbe extends SharedObject'))
+    mutations.push(['shared base', original.replace('extends SharedObject<', 'extends NativeModule<')]);
+  for (const [name, source] of mutations) {
     assert.notEqual(source, original, `mutation did not apply: ${name}`);
     const result = run(source);
     assert.equal(result.status, 1, `${name}: ${result.stderr}`);

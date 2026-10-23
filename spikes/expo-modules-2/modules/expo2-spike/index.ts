@@ -1,4 +1,4 @@
-import { NativeModule, requireNativeModule } from 'expo';
+import { NativeModule, SharedObject, requireNativeModule } from 'expo';
 
 export type ConversationId = string & {
   readonly __conversationId: unique symbol;
@@ -54,6 +54,23 @@ export type HandlerSnapshot = Readonly<{
   pending: number;
   cases: readonly HandlerReport[];
 }>;
+export type StartupReceipt = Readonly<{
+  installedMs: number;
+  firstBundleStartMs: number;
+  firstReceiptLocked: boolean;
+  delegateInstalled: boolean;
+  observedLoads: number;
+}>;
+export type PingEvent = Readonly<{ label: string }>;
+export declare class PingProbe extends SharedObject<{ ping: (event: PingEvent) => void }> {
+  constructor(label: string);
+  ping(): void;
+}
+export type ClosureProbe = Readonly<{
+  times: readonly number[];
+  threads: readonly ThreadSample[];
+  counts: readonly number[];
+}>;
 type Events = {
   change: (event: ChangeEvent) => void;
   handler: (event: HandlerWire) => void;
@@ -62,6 +79,10 @@ type Events = {
 
 declare class Expo2SpikeModule extends NativeModule<Events> {
   readonly snapshot: Snapshot;
+  readonly PingProbe: typeof PingProbe;
+  readonly startupReceipt: StartupReceipt;
+  rawAsync(callback: (sentMs: number) => Promise<number>): Promise<number>;
+  rawBlocking(callback: (sentMs: number) => number): Promise<ClosureProbe>;
   readonly handlerSnapshot: HandlerSnapshot;
   handlerRegistered(enabled: boolean): void;
   saveHandlerCheckpoint(json: string): void;

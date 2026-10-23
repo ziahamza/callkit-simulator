@@ -1,4 +1,5 @@
 import { reloadAppAsync } from 'expo';
+import { startupBeforeReload, runInterop } from './interop';
 import bridge, { HandlerReport, HandlerWire, ThreadSample } from './modules/expo2-spike';
 import type { Result } from './demonstrations';
 
@@ -20,6 +21,7 @@ type Checkpoint = {
   results: Result[];
   threads: ThreadSample[];
   cancelBeforeInvoke: boolean;
+  startup: import('./modules/expo2-spike').StartupReceipt;
 };
 
 export async function runHandlers(previous: Result[]): Promise<Result[]> {
@@ -27,6 +29,7 @@ export async function runHandlers(previous: Result[]): Promise<Result[]> {
   let saved: Checkpoint | undefined = encoded ? JSON.parse(encoded) : undefined;
   try {
     if (!saved) {
+      const startup = await startupBeforeReload();
       const runtime = bridge.handlerSnapshot.runtime;
       let received = 0;
       const threads: ThreadSample[] = [];
@@ -107,7 +110,7 @@ export async function runHandlers(previous: Result[]): Promise<Result[]> {
         );
         check(!bridge.handlerSettle(id, runtime, true, performance.now()), 'Late/duplicate settlement rejected');
       }
-      saved = { runtime, results: previous, threads, cancelBeforeInvoke };
+      saved = { runtime, results: previous, threads, cancelBeforeInvoke, startup };
       bridge.saveHandlerCheckpoint(JSON.stringify(saved));
       bridge.handlerStart('reload', 5000);
       await waitCase('reload', runtime, (value) => value.enteredMs > 0 && value.outcome === 'pending');
@@ -149,6 +152,7 @@ export async function runHandlers(previous: Result[]): Promise<Result[]> {
     );
     return [
       ...saved.results,
+      ...(await runInterop(saved.startup)),
       {
         id: 'handler',
         pass: true,
