@@ -121,7 +121,7 @@ else
   query_status=0
   SDK_ENV_QUERY_STARTED=$SECONDS
   printf 'Read inherited DYLD_INSERT_LIBRARIES with a 180-second cold-start infrastructure budget.\n' > "$OUT/launch-environment-query.log"
-  INHERITED_DYLD=$(limit 180 xcrun simctl spawn "$UDID" launchctl getenv DYLD_INSERT_LIBRARIES 2>> "$OUT/launch-environment-query.log") || query_status=$?
+  INHERITED_DYLD=$(SIMCTL_CHILD_DYLD_INSERT_LIBRARIES='' limit 180 xcrun simctl spawn "$UDID" launchctl getenv DYLD_INSERT_LIBRARIES 2>> "$OUT/launch-environment-query.log") || query_status=$?
   printf 'Query exit code: %s; elapsed seconds: %s\n' "$query_status" "$((SECONDS - SDK_ENV_QUERY_STARTED))" >> "$OUT/launch-environment-query.log"
   [[ "$query_status" -le 1 ]] || {
     printf 'Cannot read inherited launch environment (exit %s); see %s/launch-environment-query.log\n' "$query_status" "$OUT" >&2

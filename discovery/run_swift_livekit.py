@@ -18,8 +18,15 @@ from swift_livekit_conformance import BUNDLE, CASES, CLASSIFICATION, validate, v
 
 
 def command(out, label, arguments, timeout=60, check=True, env=None):
-    result = subprocess.run([str(value) for value in arguments], capture_output=True, timeout=timeout, env=env)
-    (out / (label + '.stdout')).write_bytes(result.stdout)
+    try:
+        result = subprocess.run([str(value) for value in arguments], capture_output=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired as error:
+        (out / (label + '.stdout')).write_bytes(b'' if label == 'launch-environment' else error.stdout or b'')
+        (out / (label + '.stderr')).write_bytes(error.stderr or b'')
+        save(out / (label + '.status.json'), dict(exitCode=None, error=str(error)))
+        raise
+    # The current launchd value is passed to app launches only in memory.
+    (out / (label + '.stdout')).write_bytes(b'' if label == 'launch-environment' else result.stdout)
     (out / (label + '.stderr')).write_bytes(result.stderr)
     save(out / (label + '.status.json'), dict(exitCode=result.returncode))
     require(not check or result.returncode == 0, label + ' failed: ' + str(result.returncode))
@@ -172,13 +179,18 @@ def capture(build, out):
         simulator = str(uuid.UUID(created.stdout.decode().strip())).upper()
         command(out, 'boot', ['xcrun', 'simctl', 'boot', simulator])
         command(out, 'bootstatus', ['xcrun', 'simctl', 'bootstatus', simulator, '-b'], 300)
-        inherited = os.environ.get('SIMCTL_CHILD_DYLD_INSERT_LIBRARIES')
-        if inherited is None:
+        configured = os.environ.get('SIMCTL_CHILD_DYLD_INSERT_LIBRARIES')
+        if configured is None:
+            # Match M0's cold-start infrastructure budget. The control process
+            # must not load a stale external library while reading launchd.
             result = command(out, 'launch-environment', ['xcrun', 'simctl', 'spawn', simulator, 'launchctl',
-                'getenv', 'DYLD_INSERT_LIBRARIES'], check=False)
+                'getenv', 'DYLD_INSERT_LIBRARIES'], timeout=180, check=False,
+                env={**os.environ, 'SIMCTL_CHILD_DYLD_INSERT_LIBRARIES': ''})
             require(result.returncode in (0, 1) and not result.stderr and
                     (result.returncode == 0 or not result.stdout), 'cannot read inherited launch environment')
             inherited = result.stdout.decode().removesuffix('\n')
+        else:
+            inherited = configured
         require(not any(Path(value).name in ('CKSimRuntime.dylib', 'CKSimLoader.dylib') for value in inherited.split(':')),
                 'external SDK runtime injection refused')
         require(not any(key.startswith('SIMCTL_CHILD_CKSIM_') and value for key, value in os.environ.items()),
@@ -200,7 +212,7 @@ def capture(build, out):
             if simulator:
                 codes = {}
                 for operation in ('shutdown', 'delete'):
-                    try: codes[operation] = command(out, operation, ['xcrun', 'simctl', operation, simulator], 30, check=False).returncode
+                    try: codes[operation] = command(out, operation, ['xcrun', 'simctl', operation, simulator], 60, check=False).returncode
                     except (OSError, subprocess.TimeoutExpired) as error:
                         codes[operation] = None
                         save(out / (operation + '.status.json'), dict(exitCode=None, error=str(error)))

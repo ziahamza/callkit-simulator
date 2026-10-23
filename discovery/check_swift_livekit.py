@@ -314,11 +314,23 @@ def controls():
             checks.append(label)
         # Exercise the real ownership/container orchestration with every OS call
         # replaced, and keep the public query and cleanup bounds observable.
-        for label, bad_container, shutdown_timeout in [('owned-run-one-query', False, False),
-                ('empty-container-stops-and-cleans', True, False), ('shutdown-timeout-still-deletes', False, True)]:
+        for label in ('owned-run-one-query', 'empty-container-stops-and-cleans',
+                      'shutdown-timeout-still-deletes', 'explicit-inherited-override',
+                      'empty-launchd-value', 'unknown-launchd-status-refused',
+                      'launchd-stderr-refused', 'launchd-unset-with-value-refused',
+                      'launchd-timeout-stops-and-cleans'):
+            bad_container = label == 'empty-container-stops-and-cleans'
+            query_failure = label in ('unknown-launchd-status-refused', 'launchd-stderr-refused',
+                                      'launchd-unset-with-value-refused',
+                                      'launchd-timeout-stops-and-cleans')
+            shutdown_timeout = label in ('shutdown-timeout-still-deletes', 'launchd-timeout-stops-and-cleans')
+            override = label == 'explicit-inherited-override'
             directory = root / label; directory.mkdir(); build, unused = materialize(directory)
             container = directory / 'data'; container.mkdir(); output = directory / 'actual-driver'
             invocations, shared = [], []
+            inherited = '/private/fixture-injector.dylib'
+            environment = dict(CONTROL_FIXTURE='unchanged')
+            if override: environment['SIMCTL_CHILD_DYLD_INSERT_LIBRARIES'] = inherited
             outer_handlers = {signal.SIGTERM: 'outer-term', signal.SIGINT: 'outer-int'}
             original_outer = outer_handlers.copy()
             def outer_mask(sig, handler):
@@ -331,33 +343,63 @@ def controls():
                     value = json.dumps(dict(runtimes=[dict(platform='iOS', isAvailable=True,
                         identifier='com.apple.CoreSimulator.SimRuntime.iOS-27-0', version='27.0', buildversion='synthetic')])).encode()
                 elif args[2] == 'create': value = (SIM + '\n').encode()
+                elif args[2] == 'spawn':
+                    assert args[3:] == [SIM, 'launchctl', 'getenv', 'DYLD_INSERT_LIBRARIES']
+                    assert options['timeout'] == 180
+                    assert options['env'] == {**environment, 'SIMCTL_CHILD_DYLD_INSERT_LIBRARIES': ''}
+                    if label == 'launchd-timeout-stops-and-cleans':
+                        raise subprocess.TimeoutExpired(args, options['timeout'], output=b'/private/partial-injector.dylib', stderr=b'partial-error')
+                    if label == 'unknown-launchd-status-refused': return CompletedProcess(args, 2, b'', b'')
+                    if label == 'launchd-stderr-refused': return CompletedProcess(args, 0, b'', b'unknown-query-error')
+                    if label == 'launchd-unset-with-value-refused': return CompletedProcess(args, 1, b'/private/unexpected-injector.dylib', b'')
+                    value = b'' if label == 'empty-launchd-value' else (inherited + '\n').encode()
                 elif args[2] == 'get_app_container': value = b'' if bad_container else (str(container) + '\n').encode()
                 elif args[2:4] == ['list', 'devices']: value = b'{"devices":{}}'
                 elif args[2] == 'shutdown' and shutdown_timeout:
-                    import subprocess
-                    raise subprocess.TimeoutExpired(args, options['timeout'])
+                    raise subprocess.TimeoutExpired(args, options['timeout'], output=b'partial-cleanup-output', stderr=b'cleanup-error')
                 else: value = b''
                 return CompletedProcess(args, 0, value, b'')
             def fake_case(build, out, simulator, observed, inherited, mode):
-                shared.append(observed); return dict(runID='synthetic-' + mode, pid=len(shared), supervisorPID=400 + len(shared))
+                shared.append((observed, inherited)); return dict(runID='synthetic-' + mode, pid=len(shared), supervisorPID=400 + len(shared))
             with patch.object(runner, 'validate_build'), patch.object(runner, 'source', return_value=IDENTITY), \
                  patch.object(runner, 'validate', return_value=dict(success=True)), \
                  patch.object(runner, 'capture_case', side_effect=fake_case), \
                  patch.object(runner.subprocess, 'run', side_effect=fake_run), \
                  patch.object(runner.signal, 'signal', side_effect=outer_mask), \
-                 patch.dict(runner.os.environ, {}, clear=True):
+                 patch.object(runner, 'redact', wraps=runner.redact) as redaction, \
+                 patch.dict(runner.os.environ, environment, clear=True):
                 try:
                     with redirect_stdout(io.StringIO()): runner.capture(build, output)
-                except EvidenceError:
-                    if not bad_container: raise
+                except (EvidenceError, subprocess.TimeoutExpired) as error:
+                    if label == 'launchd-timeout-stops-and-cleans':
+                        assert isinstance(error, subprocess.TimeoutExpired) and error.timeout == 180
+                    elif not (bad_container or query_failure): raise
                 else:
-                    assert not bad_container
+                    assert not (bad_container or query_failure)
+                assert isinstance(redaction.call_args.args[1], str)
             assert outer_handlers == original_outer
             query = [call for call in invocations if call[0][2] == 'get_app_container']
-            assert len(query) == 1 and query[0][1] == 60
+            if query_failure:
+                assert not query and not [call for call in invocations if call[0][2] == 'install']
+            else:
+                assert len(query) == 1 and query[0][1] == 60
+            launch_query = [call for call in invocations if call[0][2] == 'spawn']
+            assert not launch_query if override else len(launch_query) == 1
+            if launch_query: assert (output / 'launch-environment.stdout').read_bytes() == b''
             assert [call[0][2] for call in invocations[-3:]] == ['shutdown', 'delete', 'list']
-            assert [call[1] for call in invocations[-3:]] == [30, 30, 60]
-            assert not shared if bad_container else len(shared) == 2 and shared[0] is shared[1]
+            assert [call[1] for call in invocations[-3:]] == [60, 60, 60]
+            if bad_container or query_failure: assert not shared
+            else:
+                expected = '' if label == 'empty-launchd-value' else inherited
+                assert len(shared) == 2 and shared[0][0] is shared[1][0] and all(value[1] == expected for value in shared)
+            if label == 'launchd-timeout-stops-and-cleans':
+                assert (output / 'launch-environment.stderr').read_bytes() == b'partial-error'
+                assert json.loads((output / 'launch-environment.status.json').read_text())['exitCode'] is None
+                assert json.loads((output / 'shutdown.status.json').read_text())['exitCode'] is None
+                assert json.loads((output / 'cleanup.json').read_text())['deleted'] is True
+            if shutdown_timeout:
+                assert (output / 'shutdown.stdout').read_bytes() == b'partial-cleanup-output'
+                assert (output / 'shutdown.stderr').read_bytes() == b'cleanup-error'
             checks.append(label)
     return dict(success=True, classification='synthetic acceptance-gate and driver controls only', checks=len(checks), cases=checks)
 

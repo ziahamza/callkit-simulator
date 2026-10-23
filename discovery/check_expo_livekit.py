@@ -272,10 +272,10 @@ class RunnerControls(unittest.TestCase):
             patcher = patch.object(runner.os, name, return_value=4242)
             setattr(self, name, patcher.start()); self.addCleanup(patcher.stop)
 
-    def test_termination_unwinds_create_or_boot_and_cleans_only_exact_owned_name(self):
+    def test_termination_or_query_failure_cleans_only_exact_owned_name(self):
         owned = str(uuid.UUID(int=103)).upper()
         expected_name = 'expo-livekit-' + NONCE
-        for phase in ('create', 'boot'):
+        for phase in ('create', 'boot', 'query-error', 'query-diagnostic', 'query-unset-with-value', 'query-timeout'):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory(prefix='expo-livekit-runner-') as temporary:
                 root = Path(temporary); out = root / 'out'; deleted = False
                 def sim(args, *unused, **kwargs):
@@ -290,9 +290,21 @@ class RunnerControls(unittest.TestCase):
                         return SimpleNamespace(stdout=owned.encode())
                     if args[0] == 'boot':
                         self.assertEqual(args[1], owned)
-                        runner.handle_termination(signal.SIGTERM, None)
+                        if phase == 'boot': runner.handle_termination(signal.SIGTERM, None)
+                        return SimpleNamespace(returncode=0)
+                    if args[0] == 'bootstatus': return SimpleNamespace(returncode=0)
+                    if args[0] == 'spawn':
+                        self.assertEqual(args, ['spawn', owned, 'launchctl', 'getenv', 'DYLD_INSERT_LIBRARIES'])
+                        self.assertEqual(kwargs['timeout'], 180)
+                        self.assertEqual(kwargs['env'], {'SENTINEL': 'keep', 'SIMCTL_CHILD_DYLD_INSERT_LIBRARIES': ''})
+                        self.assertEqual(dict(runner.os.environ), {'SENTINEL': 'keep'})
+                        if phase == 'query-timeout': raise subprocess.TimeoutExpired('synthetic query', 180)
+                        if phase == 'query-diagnostic': return SimpleNamespace(returncode=0, stdout=b'', stderr=b'synthetic diagnostic')
+                        if phase == 'query-unset-with-value': return SimpleNamespace(returncode=1, stdout=b'unexpected value', stderr=b'')
+                        return SimpleNamespace(returncode=7, stdout=b'', stderr=b'')
                     if args[0] in ('shutdown', 'delete'):
                         self.assertEqual(args[1], owned)
+                        self.assertEqual(kwargs['timeout'], 60)
                         if args[0] == 'delete': deleted = True
                         return SimpleNamespace(returncode=0)
                     self.assertEqual(args, ['list', 'devices', '-j'])
@@ -302,19 +314,61 @@ class RunnerControls(unittest.TestCase):
                     return SimpleNamespace(stdout=json.dumps(dict(devices={'runtime': devices})).encode())
                 old_handler = object()
                 with patch.object(runner, 'source_identity', return_value=IDENTITY), patch.object(runner, 'validate_build', return_value={}), \
-                     patch.dict(runner.os.environ, {}, clear=True), patch.object(runner.uuid, 'uuid4', return_value=uuid.UUID(NONCE)), \
+                     patch.dict(runner.os.environ, {'SENTINEL': 'keep'}, clear=True), patch.object(runner.uuid, 'uuid4', return_value=uuid.UUID(NONCE)), \
                      patch.object(runner, 'sim', side_effect=sim) as command, patch.object(runner.signal, 'signal', return_value=old_handler) as handlers:
-                    with self.assertRaises(SystemExit) as stopped: runner.run(root / 'build', out)
-                self.assertEqual(stopped.exception.code, 143)
+                    with self.assertRaises((SystemExit, RuntimeError, subprocess.TimeoutExpired)) as stopped:
+                        runner.run(root / 'build', out)
+                if phase in ('create', 'boot'): self.assertEqual(stopped.exception.code, 143)
+                elif phase in ('query-error', 'query-diagnostic', 'query-unset-with-value'): self.assertIn('cannot read inherited launch environment', str(stopped.exception))
+                else: self.assertIsInstance(stopped.exception, subprocess.TimeoutExpired)
+                self.assertFalse(any(c.args[0][0] == 'install' for c in command.call_args_list))
                 self.assertEqual([c.args[0] for c in command.call_args_list if c.args[0][0] in ('shutdown', 'delete')],
                                  [['shutdown', owned], ['delete', owned]])
-                self.assertEqual(handlers.call_args_list, [call(signal.SIGTERM, signal.SIG_IGN),
-                                                           call(signal.SIGTERM, signal.SIG_IGN), call(signal.SIGINT, signal.SIG_IGN),
-                                                           call(signal.SIGTERM, old_handler), call(signal.SIGINT, old_handler)])
+                expected_handlers = ([call(signal.SIGTERM, signal.SIG_IGN)] if phase in ('create', 'boot') else [])
+                self.assertEqual(handlers.call_args_list, expected_handlers + [call(signal.SIGTERM, signal.SIG_IGN), call(signal.SIGINT, signal.SIG_IGN),
+                                                                              call(signal.SIGTERM, old_handler), call(signal.SIGINT, old_handler)])
                 cleanup = gate.read(out, 'cleanup.json')
                 self.assertTrue(cleanup['deleted'] and cleanup['absent'])
                 self.assertFalse((out / 'capture.json').exists())
                 self.killpg.assert_not_called()
+
+    def test_current_launchd_bytes_and_explicit_overrides_reach_both_app_launches(self):
+        inherited = '/private/synthetic Argént.dylib\n'
+        owned = str(uuid.UUID(int=103)).upper()
+        for override in (None, '', '/private/explicit.dylib'):
+            with self.subTest(override=override), tempfile.TemporaryDirectory(prefix='expo-livekit-runner-') as temporary:
+                root = Path(temporary); build, data = fixture(root); out = root / 'out'
+                info = gate.read(build, 'build.json')
+                env = {'SENTINEL': 'keep'}
+                if override is not None: env['SIMCTL_CHILD_DYLD_INSERT_LIBRARIES'] = override
+                reply = lambda stdout=b'': SimpleNamespace(returncode=0, stdout=stdout, stderr=b'')
+                replies = [reply(json.dumps(dict(runtimes=[dict(identifier='com.apple.CoreSimulator.SimRuntime.iOS-27-1',
+                    version='27.1', buildversion='synthetic', platform='iOS', isAvailable=True)])).encode()),
+                    reply(owned.encode()), reply(), reply()]
+                if override is None: replies.append(reply(inherited.encode() + b'\n'))
+                replies += [reply(), reply(str(build / 'example.app').encode()), reply(str(data).encode()), reply(),
+                            reply(), reply(), reply(b'{"devices": {}}')]
+                with patch.object(runner, 'source_identity', return_value=IDENTITY), patch.object(runner, 'validate_build', return_value=info), \
+                     patch.object(runner, 'validate', return_value={}), patch.dict(runner.os.environ, env, clear=True), \
+                     patch.object(runner, 'sim', side_effect=replies) as command, patch.object(runner.signal, 'signal'), \
+                     patch.object(runner, 'scenario', return_value=(b'synthetic', 4242)) as scenarios, patch('builtins.print'):
+                    runner.run(build, out)
+                    self.assertEqual(dict(runner.os.environ), env)
+                queries = [c for c in command.call_args_list if c.args[0][0] == 'spawn']
+                self.assertEqual(len(queries), int(override is None))
+                if queries:
+                    self.assertEqual(queries[0].kwargs['timeout'], 180)
+                    self.assertEqual(queries[0].kwargs['env'], {**env, 'SIMCTL_CHILD_DYLD_INSERT_LIBRARIES': ''})
+                self.assertEqual([c.args[6] for c in scenarios.call_args_list], [inherited if override is None else override] * 2)
+
+    def test_query_timeout_retains_partial_stderr_but_never_environment_stdout(self):
+        with tempfile.TemporaryDirectory(prefix='expo-livekit-runner-') as temporary:
+            out = Path(temporary)
+            failure = subprocess.TimeoutExpired('synthetic query', 180, output=b'private-environment', stderr=b'query diagnostic\n')
+            with patch.object(runner.subprocess, 'run', side_effect=failure):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    runner.sim(['spawn', 'owned', 'launchctl', 'getenv', 'DYLD_INSERT_LIBRARIES'], out, timeout=180)
+            self.assertEqual((out / 'simctl.log').read_bytes(), b'query diagnostic\n')
 
     def test_failed_scenario_reaps_private_group_with_protected_bounded_kill_fallback(self):
         for mode in ('natural', 'timeout-live', 'timeout-exited'):
@@ -345,8 +399,9 @@ class RunnerControls(unittest.TestCase):
                      patch.object(runner, 'sim', side_effect=sim) as command, \
                      patch.object(runner.signal, 'signal', side_effect=set_handler) as handlers:
                     with self.assertRaisesRegex(RuntimeError, 'synthetic configuration failure'):
-                        runner.scenario(root / 'build', out, root / 'data', 'livekit', 'run-1', 'owned', '', None)
+                        runner.scenario(root / 'build', out, root / 'data', 'livekit', 'run-1', 'owned', '/private/synthetic Argént.dylib\n', None)
                 self.assertIs(launch.call_args.kwargs['start_new_session'], True)
+                self.assertEqual(launch.call_args.kwargs['env']['SIMCTL_CHILD_DYLD_INSERT_LIBRARIES'], '/private/synthetic Argént.dylib\n')
                 self.assertIn('--inherit-launcher-group', launch.call_args.args[0])
                 command.assert_called_once_with(['terminate', 'owned', gate.BUNDLE], out, timeout=10, check=False)
                 expected = [call.poll(), call.wait(timeout=25)]

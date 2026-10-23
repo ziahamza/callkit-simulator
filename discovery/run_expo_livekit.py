@@ -37,8 +37,13 @@ def require_group_absent(pid):
 
 
 def sim(args, out, timeout=30, check=True, env=None):
-    result = subprocess.run(['xcrun', 'simctl', *map(str, args)], capture_output=True,
-                            timeout=timeout, env=env)
+    try:
+        result = subprocess.run(['xcrun', 'simctl', *map(str, args)], capture_output=True,
+                                timeout=timeout, env=env)
+    except subprocess.TimeoutExpired as error:
+        with (out / 'simctl.log').open('ab') as stream:
+            stream.write(error.stderr or b'')
+        raise
     with (out / 'simctl.log').open('ab') as stream:
         # Never copy a launchd environment value into retained logs.
         stream.write(result.stderr)
@@ -168,7 +173,7 @@ def cleanup(out, udid):
     result = dict(simulatorID=udid, deleted=False, absent=False)
     for operation in ('shutdown', 'delete'):
         try:
-            result[operation + 'ExitCode'] = sim([operation, udid], out, timeout=30, check=False).returncode
+            result[operation + 'ExitCode'] = sim([operation, udid], out, timeout=60, check=False).returncode
         except (OSError, subprocess.SubprocessError, RuntimeError) as error:
             result[operation + 'Error'] = str(error)
     try:
@@ -227,8 +232,11 @@ def run(build, out):
         if 'SIMCTL_CHILD_DYLD_INSERT_LIBRARIES' in os.environ:
             inherited = os.environ['SIMCTL_CHILD_DYLD_INSERT_LIBRARIES']
         else:
-            query = sim(['spawn', udid, 'launchctl', 'getenv', 'DYLD_INSERT_LIBRARIES'], out, timeout=60, check=False)
-            if query.returncode not in (0, 1):
+            # Isolate the observer while reading the real launchd value for app launches.
+            # Match M0's startup query budget; no call action is running yet.
+            query = sim(['spawn', udid, 'launchctl', 'getenv', 'DYLD_INSERT_LIBRARIES'], out, timeout=180, check=False,
+                        env={**os.environ, 'SIMCTL_CHILD_DYLD_INSERT_LIBRARIES': ''})
+            if query.returncode not in (0, 1) or query.stderr or (query.returncode == 1 and query.stdout):
                 raise RuntimeError('cannot read inherited launch environment')
             inherited = query.stdout.removesuffix(b'\n').decode()
         if any(Path(path).name in ('CKSimRuntime.dylib', 'CKSimLoader.dylib') for path in inherited.split(':') if path):

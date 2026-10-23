@@ -186,7 +186,7 @@ jobs:
           python3 discovery/check_expo_media_config.py | tee "$SDK_M0_BUILD_LOGS/media-selection-controls.log"
           python3 Tests/ExpoMedia/check_standard_backend.py | tee "$SDK_M0_BUILD_LOGS/standard-backend-gate-controls.log"
           bash Tests/AudioCore/run_livekit.sh | tee "$SDK_M0_BUILD_LOGS/swift-livekit-adapter-controls.log"
-          python3 discovery/check_audio_contract_cleanup.py | tee "$SDK_M0_BUILD_LOGS/audio-contract-cleanup-controls.log"
+          python3 discovery/check_audio_contract_cleanup.py 2>&1 | tee "$SDK_M0_BUILD_LOGS/audio-contract-cleanup-controls.log"
           python3 discovery/check_sdk_m2_audio_lifecycle.py | tee "$SDK_M0_BUILD_LOGS/audio-lifecycle-capture-controls.log"
           bash Tests/VoIPSDK/run_push.sh | tee "$SDK_M0_BUILD_LOGS/push-controls.log"
           bash Tests/VoIPSDK/run_projection.sh | tee "$SDK_M0_BUILD_LOGS/projection-controls.log"
