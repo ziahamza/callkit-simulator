@@ -37,6 +37,12 @@ private struct LCKMultiCallPolicy {
   static func shouldEndActiveOnResume(maximumGroups: Int, maximumPerGroup: Int) -> Bool {
     maximumGroups == 2 && maximumPerGroup == 1
   }
+  static func resumeEndDelay(nominal: Double, elapsedSinceIssued: Double) -> Double {
+    max(0, nominal - elapsedSinceIssued)
+  }
+  static func usesCompositeBarrier(system: Bool, actionCount: Int, joiningCount: Int) -> Bool {
+    system && actionCount > 1 && joiningCount > 0
+  }
   struct Handoff {
     private var gapElapsed = false
     private var joined = false
@@ -140,7 +146,8 @@ private final class LCKRuntimeComposite: @unchecked Sendable {
     }
     barrier = LCKMultiCallPolicy.Barrier(actions: actions.map(\.uuid), joining: joiningActions)
     joining = bindings; joiningRevisions = bindings.mapValues(\.holdRevision)
-    systemComposite = origin == .system && actions.count > 1
+    systemComposite = LCKMultiCallPolicy.usesCompositeBarrier(system: origin == .system,
+      actionCount: actions.count, joiningCount: bindings.count)
   }
 }
 private final class RuntimePendingAction: @unchecked Sendable {
@@ -501,7 +508,8 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       "Concrete CXTransaction identifiers and action grouping; LCK exposes neither transaction identifiers nor group membership.",
       "Application-authored composite pause/resume transactions and system UI Swap.",
       "Per-group application-owned media/group membership effects, and capacity admission errors beyond the measured outgoing Start code 7.",
-      "Expiry of LCK actions other than Pause, End and Join; 30 s remains a proposed expiry for those kinds."
+      "Expiry of LCK actions other than Pause, End and Join; 30 s remains a proposed expiry for those kinds.",
+      "Delayed or failed app Resume ordering and generated-End timing beyond the immediately fulfilled 2x1 swap-app capture; runtime scheduling remains gated on successful settlement."
     ],
     "captureSHA256": {
       "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/hold-accept.jsonl": "4699c4f9140d9956bcaef84cb2f6075e4af7c6e643bc971f3a25551ecf01c802",
@@ -889,7 +897,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
         call.ringing = false; changed(call, notifyObservers: false)
       }
       pendingActions[action.uuid] = pending
-      if provider.apiKind == .livecommunicationkit, let hold = action as? CXSetHeldCallAction,
+      if composite?.systemComposite == true, let hold = action as? CXSetHeldCallAction,
          hold.isOnHold, let call = pending.call {
         let revision = call.holdRevision
         after(profile.lckMultiCall.pausedAfterDeliverySeconds) {
@@ -913,6 +921,17 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
     let failure = LCKMultiCallPolicy.failure(kind)
     pendingActions.removeValue(forKey: action.uuid)
     if let call = item.call, calls[call.id] === call {
+      if fulfilled && item.lckComposite?.systemComposite != true {
+        switch kind {
+        case .join:
+          call.connected = true; call.held = false; call.ringing = false; changed(call)
+          reconcileAudio(provider: item.provider, delay: 0.29)
+        case .pause, .resume:
+          call.held = kind == .pause; changed(call)
+          reconcileAudio(provider: item.provider, delay: kind == .pause ? 0.09 : 0.18)
+        default: break
+        }
+      }
       if (fulfilled && kind == .end) || (!fulfilled && failure == .endRegardless) { endCall(call.id, provider: item.provider) }
       else if !fulfilled && failure == .endWithCleanup {
         after(profile.lckMultiCall.joinedAfterSettlementSeconds) {
@@ -927,7 +946,8 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
         if LCKMultiCallPolicy.shouldEndActiveOnResume(maximumGroups: Int(config.maximumCallGroups), maximumPerGroup: Int(config.maximumCallsPerCallGroup)),
            let other = calls.values.first(where: { $0.reporter === call.reporter && $0.id != call.id && $0.connected && !$0.held && !$0.ended }) {
           let revision = call.holdRevision
-          after(profile.lckMultiCall.appResumeEndDelaySeconds) {
+          let elapsed = Double(DispatchTime.now().uptimeNanoseconds - item.issuedUptime) / 1_000_000_000
+          after(LCKMultiCallPolicy.resumeEndDelay(nominal: profile.lckMultiCall.appResumeEndDelaySeconds, elapsedSinceIssued: elapsed)) {
             guard self.calls[call.id] === call, !call.held, call.holdRevision == revision,
                   self.calls[other.id] === other, !other.held else { return }
             self.deliver([CXEndCallAction(call: other.id)], item.provider, origin: .system, generation: item.generation)
@@ -938,7 +958,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
     finishLCKBarrier(item, fulfilled: fulfilled)
   }
   private func finishLCKBarrier(_ item: RuntimePendingAction, fulfilled: Bool) {
-    guard let composite = item.lckComposite,
+    guard let composite = item.lckComposite, composite.systemComposite,
           let joining = composite.barrier.settle(item.action.uuid, fulfilled: fulfilled) else { return }
     let delay = composite.systemComposite ? profile.lckMultiCall.joinedAfterSettlementSeconds : 0
     after(delay) {

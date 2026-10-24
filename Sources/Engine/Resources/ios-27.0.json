@@ -81,7 +81,8 @@
       "Concrete CXTransaction identifiers and action grouping; LCK exposes neither transaction identifiers nor group membership.",
       "Application-authored composite pause/resume transactions and system UI Swap.",
       "Per-group application-owned media/group membership effects, and capacity admission errors beyond the measured outgoing Start code 7.",
-      "Expiry of LCK actions other than Pause, End and Join; 30 s remains a proposed expiry for those kinds."
+      "Expiry of LCK actions other than Pause, End and Join; 30 s remains a proposed expiry for those kinds.",
+      "Delayed or failed app Resume ordering and generated-End timing beyond the immediately fulfilled 2x1 swap-app capture; runtime scheduling remains gated on successful settlement."
     ],
     "captureSHA256": {
       "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/hold-accept.jsonl": "4699c4f9140d9956bcaef84cb2f6075e4af7c6e643bc971f3a25551ecf01c802",

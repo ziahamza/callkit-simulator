@@ -136,6 +136,17 @@ def main():
     precondition(LCKMultiCallPolicy.shouldEndActiveOnResume(maximumGroups: 2, maximumPerGroup: 1))
     precondition(!LCKMultiCallPolicy.shouldEndActiveOnResume(maximumGroups: 2, maximumPerGroup: 2))
     precondition(!LCKMultiCallPolicy.shouldEndActiveOnResume(maximumGroups: 1, maximumPerGroup: 1))
+    precondition(LCKMultiCallPolicy.usesCompositeBarrier(system: true, actionCount: 2, joiningCount: 1))
+    precondition(!LCKMultiCallPolicy.usesCompositeBarrier(system: true, actionCount: 1, joiningCount: 1),
+                 "single Join must preserve its existing audio scheduling")
+    precondition(!LCKMultiCallPolicy.usesCompositeBarrier(system: false, actionCount: 2, joiningCount: 1),
+                 "application-authored composites were not measured")
+    precondition(!LCKMultiCallPolicy.usesCompositeBarrier(system: true, actionCount: 2, joiningCount: 0),
+                 "Start, Mute, tones and grouping must not introduce a barrier audio reconciliation")
+    precondition(LCKMultiCallPolicy.resumeEndDelay(nominal: 0.091, elapsedSinceIssued: 0) == 0.091)
+    precondition(abs(LCKMultiCallPolicy.resumeEndDelay(nominal: 0.091, elapsedSinceIssued: 0.05) - 0.041) < 0.000001)
+    precondition(LCKMultiCallPolicy.resumeEndDelay(nominal: 0.091, elapsedSinceIssued: 2) == 0,
+                 "late fulfillment must not add another full delivery-relative delay")
     let profile = try! JSONDecoder().decode(BehaviorProfile.self, from: Data(base64Encoded: "PROFILE_DATA")!)
     precondition(profile.timing(api: .callkit, answer: true, start: false).deadline == 60)
     precondition(profile.timing(api: .callkit, answer: true, start: false).expiry == 59.58)
