@@ -6,6 +6,7 @@ Native acceptance is decided by sdk_system_conformance, never by this driver.
 """
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -22,6 +23,15 @@ ROOT = Path(__file__).resolve().parents[1]
 BUNDLE = 'dev.iosvoipsdk.example'
 CASES = ('answer-end', 'decline', 'hold-accept', 'end-accept', 'mute-echo', 'provider-reset', 'push-launch')
 SCENARIO_TIMEOUT_SECONDS = 120
+PREAPP_ERROR = (f'An error was encountered processing the command (domain=NSPOSIXErrorDomain, code=3):\n'
+    f'Simulator device failed to launch {BUNDLE}.\nNo such process\n'
+    f'Underlying error (domain=NSPOSIXErrorDomain, code=3):\n'
+    f"\tApplication launch for '{BUNDLE}' did not return a process handle nor launch error.\n\tNo such process\n").encode()
+# Measured on an owned iOS 27.0 simulator, terminating installed Settings without launching it.
+NOT_RUNNING = ('An error was encountered processing the command (domain=NSPOSIXErrorDomain, code=3):\n'
+    f'Simulator device failed to terminate {BUNDLE}.\nfound nothing to terminate\n'
+    'Underlying error (domain=NSPOSIXErrorDomain, code=3):\n'
+    f'\tThe request to terminate "{BUNDLE}" failed. found nothing to terminate\n\tfound nothing to terminate\n')
 
 
 def write(path, value):
@@ -173,6 +183,72 @@ class Journey:
         self.settle(self.cli('decline' if decline else 'end', call['callUUID']))
         self.wait(lambda: self.snapshot(lambda calls: all(value['id'] != call['conversationID'] for value in calls)))
 
+    def start(self, command, env):
+        deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
+        paths = (self.runtime.parent / 'session.json', self.journal)
+        baseline = tuple(path.read_bytes() if path.exists() else None for path in paths)
+        receipt_path = self.root / (self.name + '.receipt.json')
+        for attempt in range(2):
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, self.case + ': checkpoint deadline')
+            if attempt:
+                require(self.pid is None and not (self.bindings or self.controls or self.commands) and
+                    tuple(path.read_bytes() if path.exists() else None for path in paths) == baseline and
+                    (archived / self.trace.name).read_bytes() == PREAPP_ERROR and
+                    (archived / receipt_path.name).read_bytes() == receipt_bytes,
+                    'fresh evidence before startup recovery')
+            launch = list(command)
+            with (self.root / 'supervisor.log').open('xb') as log:
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, self.case + ': checkpoint deadline')
+                launch[launch.index('--timeout') + 1] = str(remaining)
+                self.process = subprocess.Popen(launch, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                return self.wait(lambda: next((row for row in self.rows() if row['event'] == 'system.ready'), None),
+                                 max(0, deadline - time.monotonic()))
+            except RuntimeError as error:
+                # Only a completed, exact pre-app rejection is replayable. Any
+                # assertion, partial stream, or fresh app/runtime evidence fails.
+                if (str(error) != 'system supervisor exited before checkpoint' or attempt or
+                        self.case == 'push-launch' or time.monotonic() >= deadline or
+                        self.pid is not None or self.bindings or self.controls or self.commands):
+                    raise
+                try:
+                    receipt_bytes = receipt_path.read_bytes()
+                    value = json.loads(receipt_bytes)
+                    owner = self.process.pid
+                    eof = value.get('stdoutEOFSeconds')
+                    eligible = (self.process.poll() == 1 and self.trace.read_bytes() == PREAPP_ERROR and
+                        value.get('completed') is False and value.get('success') is False and
+                        value.get('error') == 'launcher exited before terminal done event' and
+                        value.get('identityError') == 'require one launcher app PID acknowledgement; got 0' and
+                        value.get('launchExitCodeBeforeCleanup') == value.get('launchExitCode') == 3 and
+                        type(eof) in (int, float) and math.isfinite(eof) and 0 <= eof < SCENARIO_TIMEOUT_SECONDS and
+                        value.get('cleanupExitCode') == 3 and value.get('cleanupStdout') == '' and
+                        value.get('cleanupStderr') == NOT_RUNNING and 'cleanupError' not in value and
+                        not any(key in value for key in ('appPID', 'launcherAppPID', 'appEntryObserved', 'lastProbeEvent')) and
+                        value.get('inheritLauncherGroup') is True and
+                        all(value.get(key) == owner for key in ('supervisorPID', 'supervisorPGID', 'supervisorSID', 'launcherPGID')) and
+                        type(value.get('launcherPID')) is int and value['launcherPID'] > 0 and value['launcherPID'] != owner and
+                        all(value.get(key) == expected for key, expected in
+                            (('runID', self.args.run_id), ('simulatorID', self.args.simulator),
+                             ('scenario', self.name), ('bundleID', BUNDLE))) and
+                        tuple(path.read_bytes() if path.exists() else None for path in paths) == baseline)
+                    if eligible:
+                        try: os.killpg(owner, 0)
+                        except ProcessLookupError: pass
+                        else: eligible = False
+                except (OSError, ValueError, TypeError):
+                    eligible = False
+                if not eligible:
+                    raise
+                # Keep the complete first attempt; the winning attempt retains
+                # the existing filenames and unchanged conformance contract.
+                archived = self.root / 'preapp-attempt-1'
+                archived.mkdir()
+                for path in (self.trace, receipt_path, self.root / 'supervisor.log'):
+                    path.rename(archived / path.name)
+
     def run(self):
         env = dict(os.environ, SIMCTL_CHILD_CKSIM_RUN_ID=self.args.run_id,
             SIMCTL_CHILD_SDK_SYSTEM_RUN_ID=self.args.run_id, SIMCTL_CHILD_SDK_SYSTEM_CASE=self.case,
@@ -189,58 +265,55 @@ class Journey:
             '--output', str(self.trace), '--receipt', str(self.root / (self.name + '.receipt.json')),
             '--run-id', self.args.run_id, '--simulator-id', self.args.simulator, '--scenario', self.name, '--bundle-id', BUNDLE,
             '--terminate-command', 'xcrun', 'simctl', 'terminate', self.args.simulator, BUNDLE, '--launch-command', *launch]
-        with (self.root / 'supervisor.log').open('xb') as log:
-            self.process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-            cleanup_required = False
-            try:
-                # Startup includes launcher preparation and console delivery;
-                # share the existing aggregate supervisor bound.
-                ready = self.wait(lambda: next((row for row in self.rows() if row['event'] == 'system.ready'), None), SCENARIO_TIMEOUT_SECONDS)
-                self.pid = ready['pid']
-                session = json.loads((self.runtime.parent / 'session.json').read_text())
-                require(session['runID'] == self.args.run_id and session['pid'] == self.pid and session['bundleID'] == BUNDLE, 'fresh runtime session differs')
-                write(self.root / 'session.json', session)
-                if self.case == 'push-launch':
-                    first = self.bind('first', json.loads((self.root / 'launch-push.json').read_text())['pushID'])
-                    response = self.cli('answer', first['callUUID'])
-                    self.wait(lambda: self.snapshot(lambda calls: any(value['id'] == first['conversationID'] and value.get('pending', {}).get('kind') == 'join' and value['pending']['origin'] == 'system' for value in calls)))
-                    self.command('attach-handler')
-                    self.settle(response)
-                    self.connected(first)
-                    self.end(first)
+        cleanup_required = False
+        try:
+            ready = self.start(command, env)
+            self.pid = ready['pid']
+            session = json.loads((self.runtime.parent / 'session.json').read_text())
+            require(session['runID'] == self.args.run_id and session['pid'] == self.pid and session['bundleID'] == BUNDLE, 'fresh runtime session differs')
+            write(self.root / 'session.json', session)
+            if self.case == 'push-launch':
+                first = self.bind('first', json.loads((self.root / 'launch-push.json').read_text())['pushID'])
+                response = self.cli('answer', first['callUUID'])
+                self.wait(lambda: self.snapshot(lambda calls: any(value['id'] == first['conversationID'] and value.get('pending', {}).get('kind') == 'join' and value['pending']['origin'] == 'system' for value in calls)))
+                self.command('attach-handler')
+                self.settle(response)
+                self.connected(first)
+                self.end(first)
+            else:
+                first = self.push('first')
+                if self.case == 'decline':
+                    self.end(first, True)
                 else:
-                    first = self.push('first')
-                    if self.case == 'decline':
-                        self.end(first, True)
-                    else:
-                        self.answer(first)
-                        if self.case in ('hold-accept', 'end-accept'):
-                            waiting = self.push('waiting')
-                            self.settle(self.cli('hold-and-accept' if self.case == 'hold-accept' else 'end-and-accept', waiting['callUUID'], '--active-call', first['callUUID']))
-                            self.wait(lambda: self.snapshot(lambda calls: any(value['id'] == first['conversationID'] and value['status'] == 'held' for value in calls) if self.case == 'hold-accept' else all(value['id'] != first['conversationID'] for value in calls)))
-                            self.connected(waiting)
-                            self.end(waiting)
-                            if self.case == 'hold-accept': self.end(first)
-                        elif self.case == 'mute-echo':
-                            self.settle(self.cli('mute', first['callUUID'], '--muted', 'true'))
-                            self.push('first', True)
-                            self.command('app-mute', first['conversationID'])
-                            self.wait(lambda: any(row['event'] == 'system.handler' and row.get('origin') == 'app' and row.get('kind') == 'mute' for row in self.rows()))
-                            self.cli('reset', expected_error='selected-provider reset requires no pending runtime actions')
-                            self.settle(self.cli('mute', first['callUUID'], '--muted', 'false'))
-                            self.command('release-mute')
-                            self.wait(lambda: any(row['event'] == 'action.settled' and row.get('origin') == 'muteEcho' for row in self.engine()))
-                            self.settle(self.cli('tones', first['callUUID'], '--digits', '12#A'))
-                            self.end(first)
-                        elif self.case == 'provider-reset':
-                            self.cli('reset')
-                            self.wait(lambda: any(row['event'] == 'system.event' and row.get('name') == 'providerReset' for row in self.rows()))
-                        else: self.end(first)
-                empty = self.wait(lambda: self.snapshot(lambda calls: calls == []))
-                self.wait(lambda: any(row['event'] == 'system.hook' and row.get('count') == 0 and row['sequence'] > empty['sequence'] for row in self.rows()))
-                self.command('finish')
-                require(self.process.wait(timeout=30) == 0, 'system supervisor refused capture')
-            finally:
+                    self.answer(first)
+                    if self.case in ('hold-accept', 'end-accept'):
+                        waiting = self.push('waiting')
+                        self.settle(self.cli('hold-and-accept' if self.case == 'hold-accept' else 'end-and-accept', waiting['callUUID'], '--active-call', first['callUUID']))
+                        self.wait(lambda: self.snapshot(lambda calls: any(value['id'] == first['conversationID'] and value['status'] == 'held' for value in calls) if self.case == 'hold-accept' else all(value['id'] != first['conversationID'] for value in calls)))
+                        self.connected(waiting)
+                        self.end(waiting)
+                        if self.case == 'hold-accept': self.end(first)
+                    elif self.case == 'mute-echo':
+                        self.settle(self.cli('mute', first['callUUID'], '--muted', 'true'))
+                        self.push('first', True)
+                        self.command('app-mute', first['conversationID'])
+                        self.wait(lambda: any(row['event'] == 'system.handler' and row.get('origin') == 'app' and row.get('kind') == 'mute' for row in self.rows()))
+                        self.cli('reset', expected_error='selected-provider reset requires no pending runtime actions')
+                        self.settle(self.cli('mute', first['callUUID'], '--muted', 'false'))
+                        self.command('release-mute')
+                        self.wait(lambda: any(row['event'] == 'action.settled' and row.get('origin') == 'muteEcho' for row in self.engine()))
+                        self.settle(self.cli('tones', first['callUUID'], '--digits', '12#A'))
+                        self.end(first)
+                    elif self.case == 'provider-reset':
+                        self.cli('reset')
+                        self.wait(lambda: any(row['event'] == 'system.event' and row.get('name') == 'providerReset' for row in self.rows()))
+                    else: self.end(first)
+            empty = self.wait(lambda: self.snapshot(lambda calls: calls == []))
+            self.wait(lambda: any(row['event'] == 'system.hook' and row.get('count') == 0 and row['sequence'] > empty['sequence'] for row in self.rows()))
+            self.command('finish')
+            require(self.process.wait(timeout=30) == 0, 'system supervisor refused capture')
+        finally:
+            if self.process is not None:
                 handlers = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGTERM, signal.SIGINT)}
                 try:
                     if self.process.poll() is None:
@@ -277,7 +350,7 @@ class Journey:
                           fixtureCommands=self.commands, supervisorPID=self.process.pid))
                 finally:
                     for sig, handler in handlers.items(): signal.signal(sig, handler)
-            require(not cleanup_required, 'failure cleanup cannot qualify a native journey')
+        require(not cleanup_required, 'failure cleanup cannot qualify a native journey')
 
 
 def run(args):

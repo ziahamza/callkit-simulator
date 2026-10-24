@@ -263,6 +263,9 @@ def run(launch, terminate, output, receipt, timeout, identity=None, console_laun
                     try:
                         stop = subprocess.run(terminate, capture_output=True, timeout=10)
                         result["cleanupExitCode"] = stop.returncode
+                        for field in ("stdout", "stderr"):
+                            raw = getattr(stop, field, None)
+                            result["cleanup" + field.capitalize()] = raw.decode(errors="backslashreplace") if isinstance(raw, bytes) else None
                     except (OSError, subprocess.TimeoutExpired) as error:
                         result["cleanupError"] = str(error)
                 try:

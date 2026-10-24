@@ -612,7 +612,7 @@ def readiness_controls():
             assert outcome == expected, (label, 'expected ' + expected, outcome, clock[0])
             assert clock[0] == elapsed, (label, 'startup bound changed', clock[0], elapsed)
             command = spawn.call_args.args[0]
-            assert command[command.index('--timeout') + 1] == '120'
+            assert float(command[command.index('--timeout') + 1]) == 120
             assert spawn.call_args.kwargs['start_new_session'] is True
             if expected == 'ready':
                 if case == 'push-launch':
@@ -627,6 +627,215 @@ def readiness_controls():
             checks.append(dict(name=label, passed=True,
                                expected='bounded startup only; real Journey wait and console-row parsing'))
     return checks
+
+
+def startup_recovery_controls(selected=None):
+    """Exercise the startup driver; simulated console children never run simctl."""
+    import run_sdk_system as runner
+    checks = []
+    cases = [('preapp-rejection-recovered-once', None)]
+    cases += [(name, dict(receipt={field: value})) for name, field, value in (
+        ('preapp-launcher-exit-not-three', 'launchExitCode', 0),
+        ('preapp-precleanup-exit-not-three', 'launchExitCodeBeforeCleanup', 0),
+        ('preapp-precleanup-exit-unknown', 'launchExitCodeBeforeCleanup', None),
+        ('preapp-cleanup-stopped-app', 'cleanupExitCode', 0),
+        ('preapp-cleanup-exit-unknown', 'cleanupExitCode', None),
+        ('preapp-cleanup-timeout', 'cleanupError', 'synthetic termination timeout'),
+        ('preapp-cleanup-stderr-unknown', 'cleanupStderr', 'synthetic unknown refusal'),
+        ('preapp-cleanup-stdout-present', 'cleanupStdout', 'synthetic fresh process'),
+        ('preapp-fresh-app-pid', 'appPID', 7203),
+        ('preapp-fresh-launcher-pid', 'launcherAppPID', 7203),
+        ('preapp-fresh-app-entry', 'appEntryObserved', True),
+        ('preapp-fresh-probe-receipt', 'lastProbeEvent', 'runtime.installed'),
+        ('preapp-completed-journey', 'completed', True),
+        ('preapp-assertion-failure', 'error', 'synthetic journey assertion'),
+        ('preapp-wrong-bundle', 'bundleID', 'synthetic.other.bundle'),
+        ('preapp-wrong-run', 'runID', 'synthetic-other-run'),
+        ('preapp-wrong-supervisor-owner', 'supervisorPID', 9999),
+    )]
+    cases += [(name, dict(kind=kind)) for name, kind in (
+        ('preapp-missing-eof', 'missing-eof'),
+        ('preapp-malformed-receipt', 'malformed-receipt'),
+        ('preapp-pid-header', 'pid-header'),
+        ('preapp-malformed-probe', 'malformed-probe'),
+        ('preapp-valid-probe', 'valid-probe'),
+        ('preapp-session-changed', 'session-changed'),
+        ('preapp-journal-changed', 'journal-changed'),
+        ('preapp-bound-conversation', 'bindings'),
+        ('preapp-control-issued', 'controls'),
+        ('preapp-fixture-command-issued', 'commands'),
+        ('preapp-bound-app-pid', 'pid'),
+        ('preapp-push-launch-never-replayed', 'push-launch'),
+        ('preapp-live-supervisor-group', 'live-group'),
+        ('preapp-unknown-supervisor-group', 'unknown-group'),
+        ('preapp-aggregate-budget-spent', 'deadline'),
+        ('preapp-second-rejection-is-terminal', 'second-failure'),
+        ('preapp-second-startup-shares-deadline', 'second-deadline'),
+        ('preapp-late-session-changed', 'late-session-changed'),
+        ('preapp-late-journal-changed', 'late-journal-changed'),
+        ('preapp-late-probe', 'late-probe'),
+        ('preapp-late-receipt-pid', 'late-receipt-pid'),
+        ('preapp-late-control', 'late-control'),
+        ('preapp-deadline-during-guard', 'deadline-during-guard'),
+    )]
+    for label, change in cases:
+        if selected is not None and label not in selected: continue
+        with tempfile.TemporaryDirectory(prefix='sdk-system-preapp-pure-') as temporary:
+            root = Path(temporary); clock = [0.0]; launched = []
+            container = root / 'container'; container.mkdir()
+            args = SimpleNamespace(run_id='synthetic-preapp', simulator='synthetic-owned', package=root)
+            kind = (change or {}).get('kind')
+            journey = runner.Journey(args, root / 'case', 'push-launch' if kind == 'push-launch' else 'decline', container)
+            journey.runtime.mkdir(parents=True)
+            session = journey.runtime.parent / 'session.json'
+            session.write_bytes(b'{"fixtureKind":"previous-case-session"}\n')
+            journey.journal.write_bytes(b'{"fixtureKind":"previous-case-journal"}\n')
+            receipt_path = journey.root / (journey.name + '.receipt.json')
+            ready = dict(event='system.ready', pid=7203)
+            first_files = {}
+            command = ['python3', str(runner.ROOT / 'discovery/run_scenario.py'),
+                '--console-launcher-stop', '--inherit-launcher-group', '--timeout', '120',
+                '--output', str(journey.trace), '--receipt', str(receipt_path),
+                '--run-id', args.run_id, '--simulator-id', args.simulator, '--scenario', journey.name,
+                '--bundle-id', runner.BUNDLE, '--terminate-command', 'xcrun', 'simctl', 'terminate',
+                args.simulator, runner.BUNDLE, '--launch-command', 'xcrun', 'simctl', 'launch',
+                '--console', args.simulator, runner.BUNDLE]
+            class Process:
+                def __init__(self, attempt): self.pid, self.attempt = 7200 + attempt, attempt
+                def poll(self): return 1 if self.attempt == 1 or kind == 'second-failure' else None
+                def wait(self, timeout): return 1
+            def spawn(argv, **kwargs):
+                attempt = len(launched) + 1
+                launched.append((list(argv), kwargs))
+                assert kwargs['start_new_session'] is True
+                assert len(launched) <= 2, 'startup recovery launched more than twice'
+                process = Process(attempt)
+                if attempt == 1 or kind == 'second-failure':
+                    clock[0] += 120 if kind == 'deadline' else .5
+                    trace = (
+                        'An error was encountered processing the command (domain=NSPOSIXErrorDomain, code=3):\n'
+                        'Simulator device failed to launch dev.iosvoipsdk.example.\nNo such process\n'
+                        'Underlying error (domain=NSPOSIXErrorDomain, code=3):\n'
+                        '\tApplication launch for \'dev.iosvoipsdk.example\' did not return a process handle nor launch error.\n'
+                        '\tNo such process\n').encode()
+                    value = dict(schemaVersion=2, completed=False, success=False,
+                        runID=args.run_id, simulatorID=args.simulator, scenario=journey.name, bundleID=runner.BUNDLE,
+                        inheritLauncherGroup=True, supervisorPID=process.pid, supervisorPGID=process.pid,
+                        supervisorSID=process.pid, launcherPID=7300 + attempt, launcherPGID=process.pid,
+                        consoleTransport='host-pty', stdoutEOFSeconds=.25, elapsedSeconds=.5,
+                        launchExitCodeBeforeCleanup=3, launchExitCode=3, cleanupExitCode=3,
+                        cleanupStdout='', cleanupStderr=(
+                            'An error was encountered processing the command (domain=NSPOSIXErrorDomain, code=3):\n'
+                            'Simulator device failed to terminate dev.iosvoipsdk.example.\n'
+                            'found nothing to terminate\n'
+                            'Underlying error (domain=NSPOSIXErrorDomain, code=3):\n'
+                            '\tThe request to terminate "dev.iosvoipsdk.example" failed. found nothing to terminate\n'
+                            '\tfound nothing to terminate\n'),
+                        error='launcher exited before terminal done event',
+                        identityError='require one launcher app PID acknowledgement; got 0')
+                    value.update((change or {}).get('receipt', {}))
+                    if kind == 'missing-eof': value.pop('stdoutEOFSeconds')
+                    if kind == 'pid-header': trace += b'dev.iosvoipsdk.example: 7203\n'
+                    if kind == 'malformed-probe': trace += b'PROBE {malformed\n'
+                    if kind == 'valid-probe': trace += b'PROBE {"event":"app.entry"}\n'
+                    if kind == 'session-changed': session.write_bytes(b'{"fixtureKind":"fresh-session"}\n')
+                    if kind == 'journal-changed': journey.journal.write_bytes(b'{"event":"runtime.installed","pid":7203}\n')
+                    if kind in ('bindings', 'controls', 'commands'): getattr(journey, kind).append('synthetic fresh journey evidence')
+                    if kind == 'pid': journey.pid = 7203
+                    journey.trace.write_bytes(trace)
+                    value['traceSHA256'] = hashlib.sha256(trace).hexdigest()
+                    receipt_path.write_text('{malformed\n' if kind == 'malformed-receipt' else json.dumps(value) + '\n')
+                    kwargs['stdout'].write(b'synthetic first supervisor diagnostic\n')
+                    kwargs['stdout'].flush()
+                    if attempt == 1:
+                        first_files.update({path.name: path.read_bytes() for path in
+                            (journey.trace, receipt_path, journey.root / 'supervisor.log')})
+                elif kind != 'second-deadline':
+                    journey.trace.write_text('PROBE ' + json.dumps(ready) + '\n')
+                return process
+            def group_absent(owner, value):
+                assert (owner, value) == (7201, 0), 'startup probed an unowned process group'
+                if kind == 'live-group': return
+                if kind == 'unknown-group': raise PermissionError('synthetic group ownership unknown')
+                if kind == 'late-session-changed': session.write_bytes(b'{"fixtureKind":"late-fresh-session"}\n')
+                if kind == 'late-journal-changed': journey.journal.write_bytes(b'{"event":"runtime.installed","pid":7203}\n')
+                if kind == 'late-probe':
+                    journey.trace.write_bytes(journey.trace.read_bytes() + b'PROBE {"event":"app.entry"}\n')
+                    first_files[journey.trace.name] = journey.trace.read_bytes()
+                if kind == 'late-receipt-pid':
+                    receipt = json.loads(receipt_path.read_text()); receipt['appPID'] = 7203
+                    receipt_path.write_text(json.dumps(receipt) + '\n')
+                    first_files[receipt_path.name] = receipt_path.read_bytes()
+                if kind == 'late-control': journey.controls.append('synthetic late fresh control')
+                raise ProcessLookupError('synthetic first supervisor group absent')
+            read_bytes = Path.read_bytes
+            def read_with_guard_delay(path):
+                value = read_bytes(path)
+                if kind == 'deadline-during-guard' and path.parent.name == 'preapp-attempt-1' and path.name == receipt_path.name:
+                    clock[0] = 120
+                return value
+            with patch.object(runner.subprocess, 'Popen', side_effect=spawn), \
+                 patch.object(runner.subprocess, 'run', side_effect=AssertionError('unexpected native command')), \
+                 patch.object(runner.time, 'monotonic', side_effect=lambda: clock[0]), \
+                 patch.object(runner.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, round(clock[0] + seconds, 3))), \
+                 patch.object(runner.os, 'killpg', side_effect=group_absent), \
+                 patch.object(Path, 'read_bytes', new=read_with_guard_delay):
+                try: result = journey.start(command, {})
+                except (RuntimeError, gate.EvidenceError):
+                    assert change is not None, label + ': exact pre-app rejection was not recovered'
+                else:
+                    assert change is None and result == ready and journey.process.pid == 7202, label + ': unsafe recovery passed'
+            expected_attempts = 2 if change is None or kind in ('second-failure', 'second-deadline') else 1
+            assert len(launched) == expected_attempts, label + ': refusal launched another supervisor'
+            assert float(launched[0][0][launched[0][0].index('--timeout') + 1]) == 120
+            archive = journey.root / 'preapp-attempt-1'
+            if expected_attempts == 2 or (kind or '').startswith('late-') or kind == 'deadline-during-guard':
+                if expected_attempts == 2:
+                    assert float(launched[1][0][launched[1][0].index('--timeout') + 1]) == 119.5
+                for name, content in first_files.items(): assert (archive / name).read_bytes() == content, name
+            else:
+                assert not archive.exists(), label + ': refused attempt was moved'
+                for name, content in first_files.items(): assert (journey.root / name).read_bytes() == content, name
+            assert clock[0] == (120 if kind in ('deadline', 'second-deadline', 'deadline-during-guard') else
+                                1 if kind == 'second-failure' else .5), label
+            checks.append(dict(name=label, passed=True,
+                expected='one bounded pre-app recovery; original attempt retained' if change is None else
+                         'fresh, partial, unknown or second-attempt evidence never triggers another launch'))
+    return checks
+
+
+def startup_cleanup_diagnostic_control():
+    """Real host console children prove cleanup diagnostics reach the receipt."""
+    import sys
+    import run_scenario as scenario
+    launch_stderr = (
+        'An error was encountered processing the command (domain=NSPOSIXErrorDomain, code=3):\n'
+        'Simulator device failed to launch dev.iosvoipsdk.example.\nNo such process\n'
+        'Underlying error (domain=NSPOSIXErrorDomain, code=3):\n'
+        '\tApplication launch for \'dev.iosvoipsdk.example\' did not return a process handle nor launch error.\n'
+        '\tNo such process\n').encode()
+    stop_stderr = (
+        'An error was encountered processing the command (domain=NSPOSIXErrorDomain, code=3):\n'
+        'Simulator device failed to terminate dev.iosvoipsdk.example.\nfound nothing to terminate\n'
+        'Underlying error (domain=NSPOSIXErrorDomain, code=3):\n'
+        '\tThe request to terminate "dev.iosvoipsdk.example" failed. found nothing to terminate\n'
+        '\tfound nothing to terminate\n')
+    def child(stderr):
+        return [sys.executable, '-c', 'import os; os.write(2, ' + repr(stderr) + '); raise SystemExit(3)']
+    with tempfile.TemporaryDirectory(prefix='sdk-system-preapp-host-') as temporary:
+        root = Path(temporary); output, receipt = root / 'trace.log', root / 'receipt.json'
+        status = scenario.run(child(launch_stderr), child(stop_stderr.encode()), output, receipt, 2,
+                              dict(bundleID='dev.iosvoipsdk.example'), console_launcher_stop=True)
+        value = json.loads(receipt.read_text())
+        assert status == 1 and value['success'] is False and value['completed'] is False
+        assert value['launchExitCodeBeforeCleanup'] == value['launchExitCode'] == value['cleanupExitCode'] == 3
+        assert value['cleanupStdout'] == '' and value['cleanupStderr'] == stop_stderr
+        assert 0 <= value['stdoutEOFSeconds'] < 2
+        assert output.read_bytes() == launch_stderr
+        assert value['traceSHA256'] == hashlib.sha256(launch_stderr).hexdigest()
+        assert value['identityError'] == 'require one launcher app PID acknowledgement; got 0'
+    return [dict(name='preapp-real-host-cleanup-diagnostics', passed=True,
+                 expected='exact EOF/exit3/cleanup stderr retained from real host children; no native launch')]
 
 
 def controls():
@@ -715,6 +924,8 @@ def controls():
     checks.extend(cleanup_controls())
     checks.extend(supervisor_controls())
     checks.extend(readiness_controls())
+    checks.extend(startup_recovery_controls())
+    checks.extend(startup_cleanup_diagnostic_control())
     return checks
 
 
