@@ -3,6 +3,8 @@
 import argparse
 import json
 import os
+import runpy
+from types import SimpleNamespace
 from pathlib import Path
 import shutil
 import subprocess
@@ -153,10 +155,14 @@ def main():
         sim('bootstatus', device, '-b', timeout=300)
         root, run_id = launch_fixture(device, args.app)
         session = fixture_session(root, run_id)
+        cli = runpy.run_path(str(ROOT / 'Tools/cksim'))
+        reader = cli['RuntimeJournal'](root, BUNDLE)
+        history = []
         assert session.get('controlTransport') == 'directory-watch-v1', 'fixture must support spawn-free mailbox controls'
         journal = root / session['runID'] / 'events.jsonl'
         def rows():
-            return [json.loads(line) for line in journal.read_text().splitlines()]
+            history.extend(reader.read())
+            return list(history)
         def calls():
             projected = {}
             for row in rows():
@@ -202,6 +208,46 @@ def main():
         wait(lambda: not calls())
         from filtered_acceptance import run_filtered_acceptance
         run_filtered_acceptance(channel=root, session=session, command=command, rows=rows, wait=wait, out=args.out)
+        from multi_acceptance import run_multi_acceptance
+        def raw_command(operation, **fields):
+            options = SimpleNamespace(operation=operation, call=fields.get('callUUID'),
+                active_call=fields.get('activeCallUUID'), group_with_call=fields.get('groupWithCallUUID'),
+                held='true' if fields.get('held') else 'false',
+                bundle=BUNDLE, runtime_dir=args.package.resolve(), app_container=root.parent.parent,
+                command_receipt=None, timeout=5)
+            return cli['control'](options, device, expected_session=session)
+        def multi_incoming(capabilities=None):
+            identifier = str(uuid.uuid4()).upper()
+            stimulus = dict(operation='incoming', callUUID=identifier)
+            if capabilities is not None:
+                stimulus['capabilities'] = capabilities
+            payload.write_text(json.dumps(stimulus))
+            command('push', '--payload-file', payload, '--must-report', 'true')
+            wait(lambda: any(call['uuid'] == identifier for call in calls()))
+            return identifier
+        def configure_group_delay(call_uuid, milliseconds):
+            identifier = str(uuid.uuid4()).upper()
+            payload.write_text(json.dumps(dict(operation='incoming', callUUID=call_uuid,
+                fixtureGroupDelayMS=milliseconds, fixtureControlID=identifier)))
+            command('push', '--payload-file', payload, '--must-report', 'true')
+            return wait(lambda: next((row for row in rows() if row['event'] == 'fixture.groupDelayConfigured'
+                                      and row.get('requestID') == identifier), None))
+        multi = run_multi_acceptance(raw_command, rows, wait, incoming=multi_incoming,
+                                     configure_group_delay=configure_group_delay)
+        (args.out / 'multi-acceptance.json').write_text(json.dumps(multi, indent=2) + '\n')
+        from application_multi_acceptance import run_application_multi_acceptance
+        def application_request(kind, call_uuid, **fields):
+            identifier = str(uuid.uuid4()).upper()
+            action = dict(id=identifier, kind=kind, callUUID=call_uuid, **fields)
+            # Re-report the existing UUID to satisfy the fixture's legacy
+            # PushKit obligation without admitting an extra temporary call.
+            payload.write_text(json.dumps(dict(operation='incoming', callUUID=call_uuid, applicationAction=action)))
+            command('push', '--payload-file', payload, '--must-report', 'true')
+            return wait(lambda: next((row for row in rows() if row['event'] == 'fixture.applicationRequestCompleted'
+                                      and row.get('requestID') == identifier), None))
+        application = run_application_multi_acceptance(raw_command, rows, wait,
+            incoming=multi_incoming, application_request=application_request)
+        (args.out / 'application-multi-acceptance.json').write_text(json.dumps(application, indent=2) + '\n')
         captured = run(ROOT / 'Tools/cksim', '--simulator', device, '--bundle', BUNDLE,
                        '--app-container', root.parent.parent, 'watch', '--json', '--duration', '0.3')
         watched = [json.loads(line) for line in captured.splitlines()]

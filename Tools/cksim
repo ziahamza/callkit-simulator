@@ -233,7 +233,7 @@ def control(args, device, expected_session=None):
     identifier = str(uuid.uuid4()).upper()
     command = {key: session[key] for key in ("runID", "pid", "bundleID")}
     command.update(id=identifier, operation=args.operation)
-    for argument, field in (("call", "callUUID"), ("active_call", "activeCallUUID")):
+    for argument, field in (("call", "callUUID"), ("active_call", "activeCallUUID"), ("group_with_call", "groupWithCallUUID")):
         if getattr(args, argument, None):
             command[field] = str(uuid.UUID(getattr(args, argument))).upper()
     if args.operation == "push":
@@ -403,6 +403,22 @@ class InspectorBridge:
             if set(value) != {"operation", "reason"} or value.get("reason") not in INCOMING_FILTER_REASONS:
                 raise RuntimeError("Invalid incoming filter control.")
             arguments = dict(vars(self.args), operation="incoming-filter", reason=value["reason"], command_receipt=None)
+            return control(SimpleNamespace(**arguments), self.device, expected_session=self.journal.session)
+        if isinstance(value, dict) and value.get("operation") in ("hold", "merge", "unmerge"):
+            operation = value["operation"]
+            expected = {"operation", "callUUID"} | ({"held"} if operation == "hold" else {"groupWithCallUUID"} if operation == "merge" else set())
+            if set(value) != expected or not isinstance(value.get("callUUID"), str):
+                raise RuntimeError("Invalid multi-call control.")
+            call = str(uuid.UUID(value["callUUID"]))
+            if operation == "hold" and value["held"] not in ("true", "false"):
+                raise RuntimeError("held must be true or false.")
+            group = value.get("groupWithCallUUID")
+            if group is not None:
+                if not isinstance(group, str):
+                    raise RuntimeError("Group target must be a UUID string.")
+                group = str(uuid.UUID(group))
+            arguments = dict(vars(self.args), operation=operation, call=call,
+                             held=value.get("held"), group_with_call=group, command_receipt=None)
             return control(SimpleNamespace(**arguments), self.device, expected_session=self.journal.session)
         if (not isinstance(value, dict) or set(value) - {"operation", "callUUID", "activeCallUUID"} or
                 value.get("operation") not in ("answer", "decline", "end", "hold-and-accept", "end-and-accept")):
@@ -600,8 +616,11 @@ def main():
                            help="Allow a supplied shared display for a bounded, background-capable test fixture")
     for operation in ("status", "events", "inspect-adapter", "install", "uninstall", "repair", "launch", "reset"):
         commands.add_parser(operation)
-    for operation in ("answer", "decline", "end"):
+    for operation in ("answer", "decline", "end", "unmerge"):
         commands.add_parser(operation).add_argument("call")
+    merge = commands.add_parser("merge", help="Move one conversation into another conversation's group")
+    merge.add_argument("call")
+    merge.add_argument("--with-call", dest="group_with_call", required=True)
     hold = commands.add_parser("hold")
     hold.add_argument("call")
     hold.add_argument("--held", choices=("true", "false"), required=True)

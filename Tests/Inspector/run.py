@@ -165,6 +165,23 @@ def verify_probe_journal(receipts, rows, session):
             configured = [row for row in rows if row['sequence'] <= receipt['cursor']
                           and row['event'] == 'incomingFilter.configured']
             assert receipt['incomingFilter'] == (configured[-1]['reason'] if configured else 'none')
+        if 'groupedConversations' in receipt:
+            live = {key: value for key, value in projected.items() if not value.get('ended')}
+            grouped = receipt['groupedConversations']
+            assert {call['uuid'] for group in grouped for call in group['calls']} == set(live)
+            assert sum(len(group['calls']) for group in grouped) == len(live)
+            for group in grouped:
+                assert group['simulatorGroupID'] and all(live[call['uuid']]['group'] == group['simulatorGroupID']
+                                                       for call in group['calls'])
+            for transaction in receipt['recentSystemTransactions']:
+                original = next(row for row in rows if row['event'] == 'transaction.delivered' and
+                                row.get('transactionID') == transaction['id'])
+                assert original['sequence'] <= receipt['cursor'] and original['origin'] == 'system'
+                assert transaction['sequence'] == original['sequence'] and 'Unverified' in transaction['verification']
+                assert len(transaction['constituents']) == len(original['actionIDs'])
+                for index, action in enumerate(transaction['constituents']):
+                    assert (action['index'], action['actionID'], action['callUUID'], action['kind'], action['parameters']) == (
+                        index, original['actionIDs'][index], original['callUUIDs'][index], original['kinds'][index], original['parameters'][index])
 
 
 def verify_timing_reference_journal(receipt, rows, required=()):
@@ -248,7 +265,7 @@ def verify_timing_reference_journal(receipt, rows, required=()):
             assert outstanding == 0, 'Older outstanding app fulfillments make mute echo ambiguous'
 
 
-def journal_journey(common, target, nonce, session, out, deadline, channel=None, verify_filters=False):
+def journal_journey(common, target, nonce, session, out, deadline, channel=None, verify_filters=False, verify_multi=False):
     """Drive controls and require the foreground Inspector's consumed projections."""
     container = Path(run('xcrun', 'simctl', 'get_app_container', target, INSPECTOR, 'data',
                          timeout=min(10, remaining_budget(deadline))))
@@ -282,7 +299,7 @@ def journal_journey(common, target, nonce, session, out, deadline, channel=None,
     incoming = probe.wait(lambda row: (row.get('incoming') or {}).get('uuid') == native_call['uuid'],
                           deadline=deadline, resume_after=resumed)
     call = incoming['incoming']
-    identifier = str(uuid.UUID(call['uuid']))
+    identifier = str(uuid.UUID(call['uuid'])).upper()
     assert call.get('ringing') and not call.get('ended') and call.get('callerName') == 'Alex Morgan'
     (out / 'inspector-incoming.json').write_text(json.dumps(incoming))
     foreground(session['bundleID'], session['pid'])
@@ -323,6 +340,43 @@ def journal_journey(common, target, nonce, session, out, deadline, channel=None,
                 for event in row['timeline']), deadline=deadline, resume_after=resumed)
             (out / ('inspector-filter-' + reason + '.json')).write_text(json.dumps(receipt))
             filter_receipts.append(receipt)
+    if verify_multi:
+        foreground(session['bundleID'], session['pid'])
+        second = str(uuid.uuid4()).upper()
+        payload.write_text(json.dumps(dict(operation='incoming', callUUID=second)))
+        assert json.loads(command('push', '--payload-file', payload, '--must-report', 'true'))['success']
+        wait_runtime(lambda rows: any(row['event'] == 'call.changed' and row.get('uuid') == second and
+                     row.get('ringing') for row in rows), channel, session, deadline)
+        composed = json.loads(command('hold-and-accept', second, '--active-call', identifier))
+        assert composed['success'] and composed['result']['transactionID']
+        ids = set(composed['result']['actionIDs'])
+        assert len(ids) == 2
+        def composite_settled(rows):
+            current = {row['uuid']: row for row in rows if row['event'] == 'call.changed'}
+            fulfilled = {row['actionID'] for row in rows if row['event'] == 'action.settled' and row.get('fulfilled')}
+            return (ids <= fulfilled and current[identifier]['held'] and current[second]['connected'] and
+                    any(row['event'] == 'audio.activated' and row['sequence'] > max(
+                        event['sequence'] for event in rows if event.get('actionID') in ids) for row in rows))
+        wait_runtime(composite_settled, channel, session, deadline)
+        merged = json.loads(command('merge', second, '--with-call', identifier))
+        assert merged['success'] and merged['result']['transactionID']
+        merge_ids = set(merged['result']['actionIDs'])
+        def merged_state(rows):
+            current = {row['uuid']: row for row in rows if row['event'] == 'call.changed'}
+            return current[second]['group'] == current[identifier]['group'] and merge_ids <= {
+                row['actionID'] for row in rows if row['event'] == 'action.settled' and row.get('fulfilled')}
+        wait_runtime(merged_state, channel, session, deadline)
+        resumed = foreground(INSPECTOR, probe.pid)
+        required_transactions = {composed['result']['transactionID'], merged['result']['transactionID']}
+        def multi_visible(row):
+            groups = row.get('groupedConversations', [])
+            return (len(groups) == 1 and {call['uuid'] for call in groups[0]['calls']} == {identifier, second} and
+                    required_transactions <= {value['id'] for value in row.get('recentSystemTransactions', [])} and
+                    any(value['maximumCallGroups'] == 3 and value['maximumCallsPerCallGroup'] == 3
+                        for value in row.get('providerConfigurations', [])))
+        multi_receipt = probe.wait(multi_visible, deadline=deadline, resume_after=resumed)
+        (out / 'inspector-multi.json').write_text(json.dumps(multi_receipt))
+        filter_receipts.append(multi_receipt)
     captured = run(*common, 'watch', '--json', '--duration', '0.3', timeout=min(5, remaining_budget(deadline)))
     (out / 'events.jsonl').write_text(captured + '\n')
     rows = [json.loads(line) for line in captured.splitlines()]
@@ -380,9 +434,12 @@ def main():
     parser.add_argument('--runtime', help='Require this exact available simulator runtime identifier')
     parser.add_argument('--driver', choices=('xctest', 'journal'), default='xctest')
     parser.add_argument('--verify-filter-controls', action='store_true', help='Verify journal-driver filter selection and clearing')
+    parser.add_argument('--verify-multicall', action='store_true', help='Verify grouped conversations and shared transaction projection')
     args = parser.parse_args()
     if args.verify_filter_controls and args.driver != 'journal':
         parser.error('--verify-filter-controls requires --driver journal')
+    if args.verify_multicall and args.driver != 'journal':
+        parser.error('--verify-multicall requires --driver journal')
     if args.fixture_installed and not args.target_simulator:
         parser.error('--fixture-installed requires an explicit --target-simulator')
     if args.driver == 'journal' and args.display_simulator and args.display_simulator != args.target_simulator:
@@ -433,7 +490,7 @@ def main():
         consumer_deadline = wait_for_inspector(bridge, out/'bridge.log', consumer_budget=25 if journal else None)
         if journal:
             print(json.dumps(journal_journey(common, target, nonce, session, out, consumer_deadline, channel,
-                                             verify_filters=args.verify_filter_controls)))
+                                             verify_filters=args.verify_filter_controls, verify_multi=args.verify_multicall)))
             return
         with (out / 'ui-test.log').open('w') as log:
             tests = subprocess.Popen(['xcodebuild','test-without-building','-project',str(project),'-scheme','InspectorUITests',

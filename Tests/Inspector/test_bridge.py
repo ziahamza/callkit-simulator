@@ -233,6 +233,8 @@ class ProbeTests(unittest.TestCase):
             if 'push' in parts or 'answer' in parts:
                 self.assertEqual(actor[0], 'fixture', 'controls need a foreground target')
                 operation = 'push' if 'push' in parts else 'answer'
+                if operation == 'answer':
+                    self.assertEqual(parts[-1], identifier, 'journey controls and state lookups must share canonical UUIDs')
                 observed.append(operation)
                 return json.dumps(dict(success=True, result=dict(actionIDs=['answer'])))
             if 'watch' in parts:

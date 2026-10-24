@@ -69,7 +69,7 @@ class FilterModelTests(unittest.TestCase):
             model.write_text('\n'.join(source[1:-1]) + '\n')
             harness.write_text(HARNESS)
             compiled = subprocess.run(['swiftc', '-swift-version', '6', '-parse-as-library', str(model),
-                *(str(ROOT / 'Inspector' / name) for name in ('RuntimeEvent.swift', 'RuntimeTimingReferences.swift', 'IncomingFilter.swift')),
+                *(str(ROOT / 'Inspector' / name) for name in ('RuntimeEvent.swift', 'RuntimeTimingReferences.swift', 'IncomingFilter.swift', 'MultiCallProjection.swift')),
                 str(harness), '-o', str(binary)], text=True, capture_output=True, timeout=60)
             self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
             for mode in ('success', 'wrong', 'missing'):

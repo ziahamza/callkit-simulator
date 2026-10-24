@@ -37,7 +37,7 @@ struct InspectorIncomingFilterState: Codable, Equatable {
   let verification: String
   var isValid: Bool { code == reason.code && verification == reason.verification }
   init?(event: RuntimeEvent) {
-    guard event.event == "incomingFilter.configured", let raw = event.reason,
+    guard event.event == "incomingFilter.configured", let raw = event.reason?.messageValue,
           let reason = InspectorIncomingFilter(rawValue: raw), let code = event.code,
           let verification = event.verification, event.requestID?.isEmpty == false else { return nil }
     self.reason = reason; self.code = code; self.verification = verification

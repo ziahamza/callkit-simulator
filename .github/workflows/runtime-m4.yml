@@ -34,11 +34,16 @@ jobs:
           python3 Tests/RuntimeEvents/test_ci_simulator.py
           python3 Tests/RuntimeEvents/test_filtered_policy.py
           python3 Tests/RuntimeEvents/test_filtered_acceptance.py
+          python3 Tests/RuntimeEvents/run_multi_policy.py
+          python3 Tests/RuntimeEvents/test_multi_acceptance.py
+          python3 Tests/RuntimeEvents/test_application_multi_acceptance.py
           python3 Tests/Inspector/test_bridge.py
           python3 Tests/Inspector/test_timing_references.py
           python3 Tests/Inspector/test_timing_receipts.py
           python3 Tests/Inspector/test_incoming_filter.py
           python3 Tests/Inspector/test_filter_model.py
+          python3 Tests/Inspector/test_multicall_projection.py
+          python3 Tests/Inspector/test_multicall_model.py
           python3 discovery/check_cli_controls.py
           python3 discovery/check_lck_provider_policy.py
       - name: Build simulator runtime and event fixture
@@ -62,7 +67,7 @@ jobs:
             --fixture "$RUNNER_TEMP/fixture/RuntimeEventFixture.app" \
             --inspector "$RUNNER_TEMP/inspector/CKSimInspector.app" --out "$RUNNER_TEMP/m4-inspector" \
             --runtime "$CKSIM_TEST_RUNTIME" --driver journal \
-            --target-simulator "$CKSIM_TEST_SIMULATOR" --fixture-installed --verify-filter-controls
+            --target-simulator "$CKSIM_TEST_SIMULATOR" --fixture-installed --verify-filter-controls --verify-multicall
       - name: Delete the owned simulator
         if: always()
         run: python3 Tests/RuntimeEvents/ci_simulator.py cleanup --id-file "$RUNNER_TEMP/m4-simulator-id"

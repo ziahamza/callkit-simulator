@@ -30,7 +30,7 @@ class RunnerTests(unittest.TestCase):
             root = Path(work)
             channel = root / 'Documents/.callkit-simulator'
             (channel / 'session').mkdir(parents=True)
-            session = dict(runID='session', pid=123, bundleID=run.BUNDLE, controlTransport='directory-watch-v1')
+            session = dict(schemaVersion=1, runID='session', pid=123, bundleID=run.BUNDLE, controlTransport='directory-watch-v1')
             (channel / 'session.json').write_text(json.dumps(session))
             # Exactly the state left when the startup ring expires before the
             # host's first observation. The next call must be host-triggered.

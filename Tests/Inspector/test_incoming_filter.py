@@ -100,6 +100,9 @@ for fields in [["code": 4], ["verification": "unverified"], ["reason": "unknown"
 }
 precondition(InspectorIncomingFilterState(event: event(["reason": "none", "code": 0,
   "verification": "not-applicable", "requestID": "clear"]))?.reason == InspectorIncomingFilter.none)
+let ended = event(["event": "report.ended", "reason": 2])
+let encoded = try! JSONSerialization.jsonObject(with: JSONEncoder().encode(ended)) as! [String: Any]
+precondition(encoded["reason"] as? Int == 2, "legacy numeric end reason must survive the Inspector feed")
 ''')
         binary = self.root / 'filter-tests'
         compiled = subprocess.run(['swiftc', '-swift-version', '6', str(root / 'Inspector/RuntimeEvent.swift'),

@@ -1,9 +1,20 @@
 import Foundation
 
-// Report completions use numeric error codes; control receipts use error text.
+struct RuntimeActionParameters: Codable {
+  var held: Bool?
+  var muted: Bool?
+  var digits: String?
+  var groupTargetUUID: String?
+}
+
+// Journal errors and reasons can be numeric codes or text.
 enum RuntimeEventError: Codable {
   case code(Int)
   case message(String)
+  var messageValue: String? {
+    if case .message(let value) = self { return value }
+    return nil
+  }
 
   init(from decoder: Decoder) throws {
     let value = try decoder.singleValueContainer()
@@ -34,8 +45,17 @@ struct RuntimeEvent: Codable, Identifiable {
   var transactionID: String?
   var pushID: String?
   var provider: String?
+  var group: String?
+  var capabilities: [String]?
+  var maximumCallGroups: Int?
+  var maximumCallsPerCallGroup: Int?
+  var actionIDs: [String]?
+  var callUUIDs: [String]?
+  var kinds: [String]?
+  var parameters: [RuntimeActionParameters]?
+  var groupTargetUUID: String?
   var requestID: String?
-  var reason: String?
+  var reason: RuntimeEventError?
   var code: Int?
   var domain: String?
   var filterReason: String?

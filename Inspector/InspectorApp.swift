@@ -48,23 +48,8 @@ struct InspectorView: View {
               CallButtons(model: model, call: call, expand: { expanded = call.uuid }, compact: true)
           }
         }
-        Section("Conversations") {
-          if model.conversations.isEmpty {
-            Text("Waiting for the app to report a call.").foregroundStyle(.secondary)
-          }
-          ForEach(model.conversations.values.sorted { $0.sequence > $1.sequence }) { call in
-            Button { expanded = call.uuid } label: {
-              HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                  Text(call.caller).foregroundStyle(.primary)
-                  Text(call.uuid ?? "").font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                }
-                Spacer()
-                Text(call.status).font(.subheadline).foregroundStyle(.secondary)
-              }.frame(minHeight: 44).contentShape(Rectangle())
-            }.buttonStyle(.plain)
-          }
-        }
+        ConversationGroups(model: model, expanded: $expanded)
+        SystemTransactions(model: model)
         Section("Audio") {
           Label(model.audioActive ? "Audio active" : "Audio inactive", systemImage: model.audioActive ? "waveform" : "speaker.slash")
             .accessibilityIdentifier("audio-state")
@@ -145,6 +130,65 @@ struct InspectorView: View {
     }
   }
 }
+private struct ConversationGroups: View {
+  @ObservedObject var model: InspectorModel
+  @Binding var expanded: String?
+  var body: some View {
+    Section {
+      if model.providerConfigurations.isEmpty { Text("Provider configuration unavailable").font(.caption).foregroundStyle(.secondary) }
+      ForEach(model.providerConfigurations) { configuration in
+        VStack(alignment: .leading, spacing: 4) {
+          Text("Configured groups: \(configuration.maximumCallGroups.map(String.init) ?? "Unavailable") · Calls per group: \(configuration.maximumCallsPerCallGroup.map(String.init) ?? "Unavailable")")
+            .font(.subheadline)
+          Text("\(configuration.apiKind ?? "API unavailable") · \(configuration.provider)").font(.caption).foregroundStyle(.secondary)
+        }.accessibilityIdentifier("provider-configuration")
+      }
+      if model.groupedConversations.isEmpty { Text("Waiting for an active conversation.").foregroundStyle(.secondary) }
+      ForEach(model.groupedConversations) { group in
+        VStack(alignment: .leading, spacing: 8) {
+          Text(group.simulatorGroupID.map { "Simulator group · " + $0 } ?? "Group unavailable")
+            .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+          ForEach(group.calls) { call in
+            Button { expanded = call.uuid } label: {
+              VStack(alignment: .leading, spacing: 4) {
+                HStack { Text(call.caller).foregroundStyle(.primary); Spacer(); Text(call.status).foregroundStyle(.secondary) }
+                Text(call.uuid ?? "").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(call.capabilities.map { $0.isEmpty ? "Capabilities: none" : "Capabilities: " + $0.joined(separator: " · ") } ?? "Capabilities unavailable")
+                  .font(.caption).foregroundStyle(.secondary)
+              }.frame(minHeight: 44).contentShape(Rectangle())
+            }.buttonStyle(.plain).accessibilityIdentifier("conversation-" + (call.uuid ?? ""))
+          }
+        }.padding(.vertical, 4)
+      }
+    } header: { Text("Simulator conversation groups") } footer: {
+      Text("Group IDs belong to the simulator; LiveCommunicationKit has no public group IDs. Pause, merge and unmerge are capabilities. Multi-call timing and ordering are unverified on device.")
+    }
+  }
+}
+private struct SystemTransactions: View {
+  @ObservedObject var model: InspectorModel
+  var body: some View {
+    if !model.recentSystemTransactions.isEmpty {
+      Section("Recent simulator system transactions") {
+        ForEach(model.recentSystemTransactions.prefix(10)) { transaction in
+          VStack(alignment: .leading, spacing: 6) {
+            Text("Simulator transaction · " + transaction.id).font(.caption).textSelection(.enabled)
+            ForEach(transaction.constituents) { action in
+              Text("\(action.index + 1). \(action.kind) · \(action.callUUID)").font(.caption)
+              Text("Action · " + action.actionID).font(.caption2).foregroundStyle(.secondary)
+              if let held = action.parameters.held { Text(held ? "Pause" : "Resume").font(.caption).foregroundStyle(.secondary) }
+              if let target = action.parameters.groupTargetUUID {
+                Text(target.isEmpty ? "Unmerge · no group target" : "Group target · " + target).font(.caption).foregroundStyle(.secondary)
+              }
+            }
+            Text(transaction.verification).font(.caption).foregroundStyle(.secondary)
+          }.padding(.vertical, 4).accessibilityElement(children: .combine)
+            .accessibilityIdentifier("system-transaction-" + transaction.id)
+        }
+      }
+    }
+  }
+}
 private struct CallButtons: View {
   @ObservedObject var model: InspectorModel
   let call: RuntimeEvent
@@ -154,12 +198,20 @@ private struct CallButtons: View {
     VStack(spacing: 12) {
       if call.ended != true {
         if call.ringing == true {
-          if let active = model.active(excluding: call.uuid) {
+          if !model.activeCandidates(excluding: call.uuid).isEmpty {
             if compact {
               Button(action: { expand?() }) { Text("Call waiting options").frame(minHeight: 44) }.buttonStyle(.borderedProminent)
             } else {
-              action("Hold & Accept", symbol: "pause.fill", operation: "hold-and-accept", tint: .green, active: active)
-              action("End & Accept", symbol: "phone.down.fill", operation: "end-and-accept", tint: .orange, active: active)
+              ForEach(model.activeCandidates(excluding: call.uuid)) { active in
+                if model.activeCandidates(excluding: call.uuid).count > 1 {
+                  Text("Active call: \(active.caller) · \(String((active.uuid ?? "").prefix(8)))")
+                    .font(.caption).foregroundStyle(.secondary)
+                }
+                if active.capabilities?.contains("pausing") == true {
+                  action("Hold & Accept", symbol: "pause.fill", operation: "hold-and-accept", tint: .green, active: active)
+                }
+                action("End & Accept", symbol: "phone.down.fill", operation: "end-and-accept", tint: .orange, active: active)
+              }
             }
             action("Decline", symbol: "phone.down.fill", operation: "decline", tint: .red)
           } else {
@@ -169,6 +221,26 @@ private struct CallButtons: View {
             }
           }
         } else {
+          if call.connected == true {
+            if call.capabilities?.contains("pausing") == true {
+              Button { model.send("hold", call: call, held: call.held != true) } label: {
+                Label(call.held == true ? "Resume" : "Pause", systemImage: call.held == true ? "play.fill" : "pause.fill").frame(minHeight: 44)
+              }.buttonStyle(.bordered).accessibilityIdentifier(call.held == true ? "resume" : "pause")
+            }
+            if call.capabilities?.contains("merging") == true {
+              Menu {
+                ForEach(model.mergeTargets(for: call)) { target in
+                  Button("\(target.caller) · \(target.uuid ?? "")") { model.send("merge", call: call, groupTarget: target) }
+                    .disabled(model.isPending(target))
+                }
+              } label: { Label("Merge with…", systemImage: "person.2.fill").frame(minHeight: 44) }
+                .disabled(model.mergeTargets(for: call).isEmpty).accessibilityIdentifier("merge")
+            }
+            if call.capabilities?.contains("unmerging") == true,
+               model.groupedConversations.contains(where: { $0.simulatorGroupID == call.group && $0.calls.count > 1 }) {
+              Button("Unmerge") { model.send("unmerge", call: call) }.frame(minHeight: 44).buttonStyle(.bordered).accessibilityIdentifier("unmerge")
+            }
+          }
           action("End Call", symbol: "phone.down.fill", operation: "end", tint: .red)
         }
       }
@@ -179,7 +251,7 @@ private struct CallButtons: View {
       Label(title, systemImage: symbol).font(.headline)
         .foregroundStyle(["answer", "hold-and-accept", "end-and-accept"].contains(operation) ? Color.black : .white)
         .frame(maxWidth: .infinity, minHeight: 44)
-    }.buttonStyle(.borderedProminent).tint(tint).accessibilityIdentifier(operation)
+    }.buttonStyle(.borderedProminent).tint(tint).disabled(active.map { model.isPending($0) } ?? false).accessibilityIdentifier(operation)
   }
 }
 private struct CallScreen: View {

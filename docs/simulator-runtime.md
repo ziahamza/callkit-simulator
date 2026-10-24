@@ -129,6 +129,8 @@ with the runtime. `status` returns full call UUIDs for subsequent commands.
 cksim --bundle com.example.app push --payload-file invitation.json --must-report true
 cksim --bundle com.example.app answer CALL_UUID
 cksim --bundle com.example.app hold CALL_UUID --held true
+cksim --bundle com.example.app merge CALL_UUID --with-call TARGET_UUID
+cksim --bundle com.example.app unmerge CALL_UUID
 cksim --bundle com.example.app hold-and-accept WAITING_UUID --active-call ACTIVE_UUID
 cksim --bundle com.example.app end-and-accept WAITING_UUID --active-call ACTIVE_UUID
 cksim --bundle com.example.app decline WAITING_UUID
@@ -176,6 +178,30 @@ The [device capture](research/callkit-simulator-probe/livecommunicationkit/push/
 is the reference for code 3; filtering never grants a repeated-caller exception.
 The native acceptance journey checks the app's actual completion NSError for
 every code, live mailbox survival beyond 4.4 s, and a real 69-second repeat.
+
+Multi-call state includes an independent simulator group ID for each group and
+the app's reported `pausing`, `merging` and `unmerging` capabilities. Merge moves
+the selected conversation into the target's group; unmerge gives the selected
+conversation a fresh group without moving its former peers. Pause/resume and
+group controls require the relevant capabilities. Application requests without
+those capabilities use `InvalidAction` (request-transaction code 6) as proposed
+simulator policy.
+
+The Inspector groups live conversations, shows observed provider limits, and
+offers explicit merge targets and active-call choices. It keeps every affected
+call pending until the shared transaction settles. Hold & Accept composes
+`[hold(active,true), answer(waiting)]`; End & Accept composes
+`[end(active), answer(waiting)]`. Constituent events share the simulator's
+delivered transaction ID, with their original order shown in the Inspector.
+LCK's public delegate exposes individual actions, without a transaction ID.
+
+All multi-call timings and ordering are `unverified` in `ios-27.0`. Configured
+group/member limits constrain mailbox group controls; native incoming-admission
+limits and application capacity-error mapping await device evidence. The
+mailbox rejects another group change while one for the same reporter is pending.
+The
+[device measurement plan](progress/2026-10-24-m5-device-needs.md) lists the exact
+states, actions and observations needed to qualify these policies.
 
 For direct launch customization, the process environment accepts `CKSIM_RUN_ID`,
 `CKSIM_PROFILE=ios-27.0` and `CKSIM_LATENCY=device`. `CKSIM_SHADOW=1` additionally

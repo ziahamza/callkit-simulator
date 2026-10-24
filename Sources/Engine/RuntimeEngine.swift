@@ -66,6 +66,16 @@ private struct IncomingReportOutcome: Sendable {
     domain = code == 0 ? "" : "com.apple.CallKit.error.incomingcall"
   }
 }
+private struct MultiCallProfile: Decodable {
+  let verification: String
+  let answerAudioActivationSeconds: Double
+  let pauseAudioDeactivationSeconds: Double
+  let resumeAudioActivationSeconds: Double
+  let lastCallDeactivationSeconds: Double
+  let remainingCallDeactivationSeconds: Double
+  let handoffDeactivationSeconds: Double
+  let handoffRecheckSeconds: Double
+}
 private struct BehaviorProfile: Decodable {
   let id: String
   let schemaVersion: Int
@@ -80,6 +90,7 @@ private struct BehaviorProfile: Decodable {
   let reportLatencySeconds: Double
   let pushReportDeadlineSeconds: Double
   let incomingFilterPolicies: [String: IncomingFilterPolicy]
+  let multiCall: MultiCallProfile
   let muteEchoSeconds: Double
   let postEndUnmuteSeconds: Double
   let fulfilledPostEndUnmutePolicy: FulfilledPostEndUnmutePolicy
@@ -113,11 +124,12 @@ private final class CallState: @unchecked Sendable {
   var held = false
   var ended = false
   var muted = false
-  var group: UUID
+  // A group is independent of any member, including the call first joined.
+  var group = UUID()
   var ringing = true
   var pushID = ""
   init(_ id: UUID, _ reporter: ProviderRegistration) {
-    self.id = id; self.reporter = reporter; self.group = id
+    self.id = id; self.reporter = reporter
   }
   func snapshot() -> CXCall {
     CKSimMakeCall(id, outgoing, connected, held, ended)
@@ -173,12 +185,58 @@ private struct Command: Decodable {
   let operation: String
   var callUUID: UUID?
   var activeCallUUID: UUID?
+  var groupWithCallUUID: UUID?
   var held: Bool?
   var muted: Bool?
   var digits: String?
   var mustReport: Bool?
   var faults: Faults?
   var reason: String?
+}
+
+// Simulator control policy only. Capacity and capability rejection at this
+// mailbox seam does not claim a measured CallKit admission error or timing.
+private struct MultiCallPolicy {
+  struct Call {
+    let id: UUID
+    let group: UUID
+    let connected: Bool
+    let ended: Bool
+    let capabilities: Set<String>
+  }
+  enum Operation { case hold, merge(UUID), unmerge }
+  static func capabilityRejection(_ operation: Operation, source: Set<String>, target: Set<String> = []) -> String? {
+    let capability: String
+    switch operation { case .hold: capability = "pausing"; case .merge: capability = "merging"; case .unmerge: capability = "unmerging" }
+    guard source.contains(capability) else { return "call does not support \(capability)" }
+    if case .merge = operation, !target.contains("merging") { return "group target does not support merging" }
+    return nil
+  }
+  static func rejection(_ operation: Operation, callID: UUID, calls: [UUID: Call],
+                        maximumCallGroups: Int, maximumCallsPerCallGroup: Int, groupChangePending: Bool = false) -> String? {
+    guard let call = calls[callID], !call.ended else { return "unknown call" }
+    guard call.connected else { return "call must be connected" }
+    if groupChangePending {
+      switch operation { case .merge, .unmerge: return "group change already pending"; case .hold: break }
+    }
+    switch operation {
+    case .hold:
+      return capabilityRejection(operation, source: call.capabilities)
+    case .merge(let targetID):
+      guard targetID != callID else { return "merge target must be another call" }
+      guard let target = calls[targetID], !target.ended else { return "unknown group target" }
+      guard target.connected else { return "group target must be connected" }
+      if let reason = capabilityRejection(operation, source: call.capabilities, target: target.capabilities) { return reason }
+      let targetCount = calls.values.filter { !$0.ended && $0.group == target.group && $0.id != callID }.count
+      return targetCount < maximumCallsPerCallGroup ? nil : "maximumCallsPerCallGroup reached"
+    case .unmerge:
+      if let reason = capabilityRejection(operation, source: call.capabilities) { return reason }
+      let live = calls.values.filter { !$0.ended }
+      let groupCount = Set(live.map(\.group)).count
+      let leavesPeer = live.contains { $0.id != callID && $0.group == call.group }
+      return groupCount + (leavesPeer ? 1 : 0) <= maximumCallGroups ? nil : "maximumCallGroups reached"
+    }
+  }
 }
 
 // RuntimeEngine's serial state queue owns this value. An ambiguous same-UUID
@@ -327,8 +385,12 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
     profile = try JSONDecoder().decode(BehaviorProfile.self, from: Self.profileData(profileID))
     let durations = [profile.answerExpirySeconds, profile.ringTimeoutSeconds, profile.unknownProviderSeconds,
       profile.actionTimeoutSeconds, profile.startDeadlineSeconds, profile.answerDeadlineSeconds,
-      profile.ordinaryDeadlineSeconds, profile.lckActionDeadlineSeconds, profile.pushReportDeadlineSeconds, profile.reportLatencySeconds, profile.muteEchoSeconds, profile.postEndUnmuteSeconds]
-    guard profile.schemaVersion == 1 && profile.id == profileID && durations.allSatisfy({ $0.isFinite && $0 > 0 }) else {
+      profile.ordinaryDeadlineSeconds, profile.lckActionDeadlineSeconds, profile.pushReportDeadlineSeconds, profile.reportLatencySeconds, profile.muteEchoSeconds, profile.postEndUnmuteSeconds,
+      profile.multiCall.answerAudioActivationSeconds, profile.multiCall.pauseAudioDeactivationSeconds,
+      profile.multiCall.resumeAudioActivationSeconds, profile.multiCall.lastCallDeactivationSeconds,
+      profile.multiCall.remainingCallDeactivationSeconds, profile.multiCall.handoffDeactivationSeconds,
+      profile.multiCall.handoffRecheckSeconds]
+    guard profile.schemaVersion == 1 && profile.id == profileID && profile.multiCall.verification == "unverified" && durations.allSatisfy({ $0.isFinite && $0 > 0 }) else {
       throw BootstrapError.invalid("invalid behavior profile")
     }
     let filteredReasons = IncomingFilterReason.allCases.filter { $0 != .none }
@@ -417,7 +479,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
   "providerRouting": "newest-created",
   "waitingAnswer": "system-only",
   "transactionIdentity": "fresh-transaction-preserved-actions",
-  "scope": "Measured iOS 27.0 behavior; not a guarantee for other iOS releases.",
+  "scope": "Contains measured iOS 27.0 references and explicitly unverified simulator policies; not a guarantee for other iOS releases.",
   "postEndUnmuteSeconds": 0.08,
   "fulfilledPostEndUnmutePolicy": {
     "callkit": "timeout",
@@ -507,6 +569,38 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       ],
       "scope": "Unverified on device. NSError code follows the public incoming-call error identity; 2.07 s is explicit simulator policy borrowed from measured DND timing, not a measurement for this reason."
     }
+  },
+  "multiCall": {
+    "verification": "unverified",
+    "answerAudioActivationSeconds": 0.29,
+    "pauseAudioDeactivationSeconds": 0.09,
+    "resumeAudioActivationSeconds": 0.18,
+    "lastCallDeactivationSeconds": 0.1,
+    "remainingCallDeactivationSeconds": 1.15,
+    "handoffDeactivationSeconds": 0.12,
+    "handoffRecheckSeconds": 0.15,
+    "scope": "All multi-call timing and ordering are proposed simulator policy, unverified on the reference iPhone 13. Single-call observations do not qualify multi-call behavior.",
+    "groups": "Independent simulator group identifiers; a merge moves only the selected call, and unmerge creates its own group. LCK has no public group identifier.",
+    "capabilities": "Pausing, merging and unmerging mirror the reported capability flags. App requests without required capabilities use documented InvalidAction=6 as unverified simulator policy.",
+    "capacity": "Public configured limits constrain simulator mailbox merge/unmerge controls. Incoming admission limits and app-transaction capacity error mapping remain unverified and are not synthesized.",
+    "systemTransactions": {
+      "holdAndAccept": [
+        "hold(active,true)",
+        "answer(waiting)"
+      ],
+      "endAndAccept": [
+        "end(active)",
+        "answer(waiting)"
+      ],
+      "qualification": "Simulator composition and constituent ordering; LCK multi-call delivery, settlement, state and audio ordering remain unverified. Transaction IDs belong to the simulator; LCK exposes individual action callbacks."
+    },
+    "deviceNeeds": [
+      "Hold & Accept and End & Accept action/deadline/settlement/state/audio ordering",
+      "Pause/resume/swap and merge/unmerge both anchor and member; three-call selected-member moves",
+      "Group/member capacity 1x1,2x1,1x2,2x2: exact admission/action outcomes and capacity release",
+      "Pausing/merging/unmerging capability changes and direct app-action validation",
+      "Delayed, reversed, failed and expired composite constituents: partial effects and cancellation"
+    ]
   }
 }
 """#
@@ -651,10 +745,17 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       selected = entry
       let generation = entry.generation
       after(0.05) { if entry.valid && entry.generation == generation { self.callback(entry) { $0.providerDidBegin?(provider) } } }
-      record(event: "provider.created", fields: ["provider": providerID(provider)])
+      record(event: "provider.created", fields: providerConfigurationJSON(entry))
     }
   }
   private func providerID(_ provider: CXProvider) -> String { String(describing: ObjectIdentifier(provider)) }
+  private func providerConfigurationJSON(_ registration: ProviderRegistration) -> [String: Any] {
+    let configuration = registration.provider.configuration
+    return ["provider": providerID(registration.provider), "apiKind": registration.apiKind.rawValue,
+      "selected": registration === selected, "valid": registration.valid,
+      "maximumCallGroups": configuration.maximumCallGroups,
+      "maximumCallsPerCallGroup": configuration.maximumCallsPerCallGroup]
+  }
   private func callback(_ provider: ProviderRegistration, _ block: @escaping @Sendable (any CXProviderDelegate) -> Void) {
     guard let delegate = provider.delegate else { return }
     let generation = provider.generation
@@ -692,11 +793,25 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       }
     }
   }
+  private func capabilities(_ call: CallState) -> [String] {
+    var result: [String] = []
+    if call.update?.supportsHolding == true { result.append("pausing") }
+    if call.update?.supportsGrouping == true { result.append("merging") }
+    if call.update?.supportsUngrouping == true { result.append("unmerging") }
+    return result
+  }
   private func callJSON(_ call: CallState) -> [String: Any] {
     ["uuid": call.id.uuidString, "outgoing": call.outgoing, "connected": call.connected,
      "held": call.held, "ended": call.ended, "muted": call.muted, "group": call.group.uuidString,
-     "ringing": call.ringing, "callerName": call.update?.localizedCallerName ?? "",
+     "ringing": call.ringing, "capabilities": capabilities(call), "callerName": call.update?.localizedCallerName ?? "",
      "handle": call.update?.remoteHandle?.value ?? ""]
+  }
+  private func actionParameters(_ action: CXAction) -> [String: Any] {
+    if let hold = action as? CXSetHeldCallAction { return ["held": hold.isOnHold] }
+    if let mute = action as? CXSetMutedCallAction { return ["muted": mute.isMuted] }
+    if let tones = action as? CXPlayDTMFCallAction { return ["digits": tones.digits] }
+    if let group = action as? CXSetGroupCallAction { return ["groupTargetUUID": group.callUUIDToGroupWith?.uuidString ?? ""] }
+    return [:]
   }
   private func actionFields(_ item: RuntimePendingAction) -> [String: Any] {
     let timing = profile.timing(api: item.apiKind, answer: item.action is CXAnswerCallAction, start: item.action is CXStartCallAction)
@@ -719,7 +834,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       "deadlineMS": Int64(item.issuedAt.addingTimeInterval(timing.deadline).timeIntervalSince1970 * 1000),
       "deadlineSeconds": timing.deadline, "expirySeconds": timing.expiry,
       "latencyMS": Double(DispatchTime.now().uptimeNanoseconds - item.issuedUptime) / 1_000_000]
-    if let mute = item.action as? CXSetMutedCallAction { fields["muted"] = mute.isMuted }
+    fields.merge(actionParameters(item.action)) { _, new in new }
     return fields
   }
   private func requestError(_ code: Int) -> NSError {
@@ -733,12 +848,21 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       if action is CXStartCallAction {
         if calls[action.callUUID] != nil || !starts.insert(action.callUUID).inserted { return requestError(5) }
       } else {
-        guard calls[action.callUUID] != nil else { return requestError(4) }
+        guard let call = calls[action.callUUID] else { return requestError(4) }
         if action is CXAnswerCallAction && origin == .application && calls.values.contains(where: { $0.id != action.callUUID && !$0.ended }) {
           return requestError(6)
         }
-        if let group = action as? CXSetGroupCallAction, let other = group.callUUIDToGroupWith, calls[other] == nil {
-          return requestError(4)
+        // Proposed simulator capability policy; 6 is documented InvalidAction,
+        // while device rejection timing and state restrictions remain unverified.
+        if action is CXSetHeldCallAction,
+           MultiCallPolicy.capabilityRejection(.hold, source: Set(capabilities(call))) != nil { return requestError(6) }
+        if let group = action as? CXSetGroupCallAction {
+          let target = group.callUUIDToGroupWith.flatMap { calls[$0] }
+          if group.callUUIDToGroupWith != nil && target == nil { return requestError(4) }
+          if group.callUUIDToGroupWith == call.id { return requestError(6) }
+          let operation = group.callUUIDToGroupWith.map { MultiCallPolicy.Operation.merge($0) } ?? .unmerge
+          if MultiCallPolicy.capabilityRejection(operation, source: Set(capabilities(call)),
+            target: target.map { Set(capabilities($0)) } ?? []) != nil { return requestError(6) }
         }
       }
     }
@@ -791,20 +915,16 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       call.outgoing = true; call.ringing = false; calls[call.id] = call; changed(call)
     }
   }
-  private func deliver(_ actions: [CXAction], _ provider: ProviderRegistration, origin: ActionOrigin, requestID: UUID? = nil, generation: UInt64? = nil) {
-    guard provider.valid && (generation == nil || provider.generation == generation) else { return }
+  @discardableResult
+  private func deliver(_ actions: [CXAction], _ provider: ProviderRegistration, origin: ActionOrigin, requestID: UUID? = nil, generation: UInt64? = nil) -> UUID? {
+    guard provider.valid && (generation == nil || provider.generation == generation) else { return nil }
     // Creation with the same concrete actions intentionally yields a fresh transaction UUID.
     let delivered = CXTransaction(actions: actions)
     record(event: "transaction.delivered", fields: ["transactionID": delivered.uuid.uuidString,
       "requestID": requestID?.uuidString ?? "system", "origin": origin.rawValue,
       "provider": providerID(provider.provider), "actionIDs": actions.map { $0.uuid.uuidString },
       "callUUIDs": actions.map { ($0 as? CXCallAction)?.callUUID.uuidString ?? "" },
-      "parameters": actions.map { action -> [String: Any] in
-        if let hold = action as? CXSetHeldCallAction { return ["held": hold.isOnHold] }
-        if let mute = action as? CXSetMutedCallAction { return ["muted": mute.isMuted] }
-        if let tones = action as? CXPlayDTMFCallAction { return ["digits": tones.digits] }
-        return [:]
-      },
+      "parameters": actions.map { actionParameters($0) },
       "kinds": actions.map { NSStringFromClass(type(of: $0)) }])
     for action in actions {
       let timing = profile.timing(api: provider.apiKind,
@@ -826,6 +946,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       }
     }
     callback(provider) { CKSimPerform($0, provider.provider, delivered) }
+    return delivered.uuid
   }
   private func expire(_ item: RuntimePendingAction) {
     record(event: "action.expired", fields: actionFields(item))
@@ -884,13 +1005,13 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       }
       switch action {
       case is CXAnswerCallAction:
-        call.connected = true; call.ringing = false; changed(call); reconcileAudio(provider: item.provider, delay: 0.29)
+        call.connected = true; call.ringing = false; changed(call); reconcileAudio(provider: item.provider, delay: profile.multiCall.answerAudioActivationSeconds)
       case is CXStartCallAction:
         reconcileAudio(provider: item.provider, delay: 0.23)
       case is CXEndCallAction:
         endCall(call.id, provider: item.provider)
       case let hold as CXSetHeldCallAction:
-        call.held = hold.isOnHold; changed(call); reconcileAudio(provider: item.provider, delay: hold.isOnHold ? 0.09 : 0.18)
+        call.held = hold.isOnHold; changed(call); reconcileAudio(provider: item.provider, delay: hold.isOnHold ? profile.multiCall.pauseAudioDeactivationSeconds : profile.multiCall.resumeAudioActivationSeconds)
       case let mute as CXSetMutedCallAction:
         call.muted = mute.isMuted; changed(call, notifyObservers: false)
         if item.origin == .application {
@@ -904,7 +1025,8 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
           guard let target = item.groupTarget, calls[other] === target else { return true }
           call.group = target.group
         }
-        else { call.group = call.id }
+        else { call.group = UUID() }
+        changed(call, notifyObservers: false)
         record(event: "call.grouped", fields: callJSON(call))
       default: break
       }
@@ -914,7 +1036,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
   private func endCall(_ uuid: UUID, provider: ProviderRegistration) {
     guard let call = calls.removeValue(forKey: uuid) else { return }
     call.ended = true; call.ringing = false; changed(call)
-    reconcileAudio(provider: provider, delay: calls.isEmpty ? 0.1 : 1.15)
+    reconcileAudio(provider: provider, delay: calls.isEmpty ? profile.multiCall.lastCallDeactivationSeconds : profile.multiCall.remainingCallDeactivationSeconds)
     if call.muted && provider.valid {
       let generation = provider.generation
       after(profile.postEndUnmuteSeconds) {
@@ -1045,7 +1167,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
     guard desired != audioActive else {
       if !desired && handoffPending {
         handoffPending = false
-        reconcileAudio(provider: provider, delay: 0.15)
+        reconcileAudio(provider: provider, delay: self.profile.multiCall.handoffRecheckSeconds)
       }
       return
     }
@@ -1074,7 +1196,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
         }
         if !desired && self.handoffPending {
           self.handoffPending = false
-          self.reconcileAudio(provider: provider, delay: 0.15)
+          self.reconcileAudio(provider: provider, delay: self.profile.multiCall.handoffRecheckSeconds)
         }
       }
     }
@@ -1114,10 +1236,28 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       }
     }
   }
+  private func validateControl(_ operation: MultiCallPolicy.Operation, call: CallState) throws {
+    let configuration = call.reporter.provider.configuration
+    let owned = calls.values.filter { $0.reporter === call.reporter }
+    let snapshots = Dictionary(uniqueKeysWithValues: owned.map {
+      ($0.id, MultiCallPolicy.Call(id: $0.id, group: $0.group, connected: $0.connected,
+                                 ended: $0.ended, capabilities: Set(capabilities($0))))
+    })
+    if let reason = MultiCallPolicy.rejection(operation, callID: call.id, calls: snapshots,
+      maximumCallGroups: Int(configuration.maximumCallGroups),
+      maximumCallsPerCallGroup: Int(configuration.maximumCallsPerCallGroup),
+      groupChangePending: pendingActions.values.contains {
+        !$0.settled && $0.action is CXSetGroupCallAction && $0.call?.reporter === call.reporter
+      }) {
+      throw ControlError.invalid(reason)
+    }
+  }
   private func execute(_ command: Command, _ object: [String: Any]) throws -> [String: Any] {
     switch command.operation {
-    case "status": return ["calls": calls.values.map(callJSON), "pending": pendingActions.values.filter { !$0.settled }.count, "audioActive": audioActive, "sequence": sequence,
-      "incomingFilter": incomingFilter.snapshot(policy: profile.incomingFilterPolicies[incomingFilter.rawValue])]
+    case "status": return ["calls": calls.values.map(callJSON), "pending": pendingActions.values.filter { !$0.settled }.count,
+      "audioActive": audioActive, "sequence": sequence,
+      "incomingFilter": incomingFilter.snapshot(policy: profile.incomingFilterPolicies[incomingFilter.rawValue]),
+      "providerConfigurations": providers.values.sorted { providerID($0.provider) < providerID($1.provider) }.map(providerConfigurationJSON)]
     case "events": return ["events": (try? String(contentsOf: controlRoot.appendingPathComponent("events.jsonl"), encoding: .utf8)) ?? ""]
     case "inspect-adapter":
       let name = "CallKitVoIPPushDelegate"
@@ -1163,14 +1303,23 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       callback(provider) { $0.providerDidReset(provider.provider) }
       return ["reset": true, "provider": providerID(provider.provider)]
     default:
-      guard let provider = selected, provider.valid, let uuid = command.callUUID, calls[uuid] != nil else { throw ControlError.invalid("unknown call or provider") }
+      guard let provider = selected, provider.valid, let uuid = command.callUUID,
+            let call = calls[uuid], !call.ended else { throw ControlError.invalid("unknown call or provider") }
       let actions: [CXAction]
       switch command.operation {
       case "answer": actions = [CXAnswerCallAction(call: uuid)]
       case "decline", "end": actions = [CXEndCallAction(call: uuid)]
       case "hold":
         guard let held = command.held else { throw ControlError.invalid("held required") }
+        try validateControl(.hold, call: call)
         actions = [CXSetHeldCallAction(call: uuid, onHold: held)]
+      case "merge":
+        guard let target = command.groupWithCallUUID else { throw ControlError.invalid("groupWithCallUUID required") }
+        try validateControl(.merge(target), call: call)
+        actions = [CXSetGroupCallAction(call: uuid, callUUIDToGroupWith: target)]
+      case "unmerge":
+        try validateControl(.unmerge, call: call)
+        actions = [CXSetGroupCallAction(call: uuid, callUUIDToGroupWith: nil)]
       case "mute":
         guard let muted = command.muted else { throw ControlError.invalid("muted required") }
         actions = [CXSetMutedCallAction(call: uuid, muted: muted)]
@@ -1181,7 +1330,9 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
         }
         actions = [CXPlayDTMFCallAction(call: uuid, digits: digits, type: .singleTone)]
       case "hold-and-accept", "end-and-accept":
-        guard let active = command.activeCallUUID, active != uuid, calls[active]?.connected == true else { throw ControlError.invalid("activeCallUUID required") }
+        guard let active = command.activeCallUUID, active != uuid, let activeCall = calls[active],
+              activeCall.connected, !activeCall.ended else { throw ControlError.invalid("activeCallUUID required") }
+        if command.operation == "hold-and-accept" { try validateControl(.hold, call: activeCall) }
         actions = [command.operation == "hold-and-accept" ? CXSetHeldCallAction(call: active, onHold: true) : CXEndCallAction(call: active), CXAnswerCallAction(call: uuid)]
       default: throw ControlError.invalid("unsupported operation")
       }
@@ -1191,11 +1342,13 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
         handoffPending = true
         audioRevision += 1
         let revision = audioRevision
-        after(0.12) { self.changeAudio(false, provider: provider, revision: revision) }
+        after(profile.multiCall.handoffDeactivationSeconds) { self.changeAudio(false, provider: provider, revision: revision) }
       }
-      deliver(actions, provider, origin: .system, requestID: command.id)
+      guard let transactionID = deliver(actions, provider, origin: .system, requestID: command.id) else {
+        throw ControlError.invalid("provider unavailable")
+      }
       if actions.count == 2 && faults.invalidateDuringHandoff == true { provider.provider.invalidate() }
-      return ["actionIDs": actions.map { $0.uuid.uuidString }]
+      return ["actionIDs": actions.map { $0.uuid.uuidString }, "transactionID": transactionID.uuidString]
     }
   }
 }

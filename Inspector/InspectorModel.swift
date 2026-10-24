@@ -17,6 +17,7 @@ private struct EventBatch: Decodable {
 private struct ControlResult: Decodable {
   struct Result: Decodable {
     var actionIDs: [String]?
+    var transactionID: String?
     var incomingFilter: InspectorIncomingFilterState?
   }
   var id: String?
@@ -39,6 +40,9 @@ private struct InspectorProbeSnapshot: Encodable {
   let cursor: Int
   let incoming: RuntimeEvent?
   let conversations: [RuntimeEvent]
+  let groupedConversations: [InspectorConversationGroup]
+  let providerConfigurations: [InspectorProviderConfiguration]
+  let recentSystemTransactions: [InspectorSystemTransaction]
   let pending: [RuntimeEvent]
   let timeline: [RuntimeEvent]
   let timelinePresentation: [TimelinePresentation]
@@ -61,6 +65,8 @@ final class InspectorModel: ObservableObject {
   @Published var error: String?
   @Published var commandError: String?
   @Published var incomingFilter: InspectorIncomingFilter = .none
+  @Published private var providerRows: [String: RuntimeEvent] = [:]
+  @Published private var transactionRows: [String: RuntimeEvent] = [:]
   private var cursor = 0
   private var acknowledgedActions = Set<String>()
   private var actionOrder: [String] = []
@@ -80,11 +86,26 @@ final class InspectorModel: ObservableObject {
     conversations.values.filter { $0.ringing == true && $0.ended != true }.sorted { $0.sequence < $1.sequence }.first
   }
   var timingReferences: [RuntimeTimingReadout] { RuntimeTimingReferences.project(timeline) }
+  var groupedConversations: [InspectorConversationGroup] { InspectorMultiCallProjection.groups(Array(conversations.values)) }
+  var providerConfigurations: [InspectorProviderConfiguration] { InspectorMultiCallProjection.configurations(Array(providerRows.values)) }
+  var recentSystemTransactions: [InspectorSystemTransaction] { InspectorMultiCallProjection.systemTransactions(Array(transactionRows.values)) }
   func active(excluding id: String?) -> RuntimeEvent? {
-    conversations.values.filter { $0.uuid != id && $0.connected == true && $0.held != true && $0.ended != true }
-      .sorted { $0.sequence < $1.sequence }.first
+    activeCandidates(excluding: id).first
   }
-  func isPending(_ call: RuntimeEvent) -> Bool { pending.values.contains { $0.callUUID == call.uuid } }
+  func activeCandidates(excluding id: String?) -> [RuntimeEvent] {
+    conversations.values.filter { $0.uuid != id && $0.connected == true && $0.held != true && $0.ended != true }
+      .sorted { $0.sequence < $1.sequence }
+  }
+  func isPending(_ call: RuntimeEvent) -> Bool {
+    guard let id = call.uuid else { return false }
+    return InspectorMultiCallProjection.pendingCallIDs(transactions: Array(transactionRows.values), pending: Array(pending.values)).contains(id)
+  }
+  func mergeTargets(for call: RuntimeEvent) -> [RuntimeEvent] {
+    conversations.values.filter {
+      $0.uuid != call.uuid && $0.connected == true && $0.ended != true && $0.capabilities?.contains("merging") == true &&
+        (call.group == nil || $0.group == nil || call.group != $0.group)
+    }.sorted { $0.sequence < $1.sequence }
+  }
 
   private func request(_ path: String, body: [String: String]? = nil) async throws -> Data {
     guard let endpoint, endpoint.host == "127.0.0.1", endpoint.scheme == "http", !token.isEmpty else {
@@ -138,6 +159,8 @@ final class InspectorModel: ObservableObject {
       wallTimeMS: Int64(Date().timeIntervalSince1970 * 1000), startedWallTimeMS: probe.startedWallTimeMS,
       session: session, cursor: cursor, incoming: incoming,
       conversations: conversations.values.sorted { $0.sequence < $1.sequence },
+      groupedConversations: groupedConversations, providerConfigurations: providerConfigurations,
+      recentSystemTransactions: recentSystemTransactions,
       pending: pending.values.sorted { $0.sequence < $1.sequence }, timeline: timeline,
       timelinePresentation: timeline.map { .init(sequence: $0.sequence, title: $0.title, detail: $0.detail) },
       timingReferences: timingReferences,
@@ -150,6 +173,18 @@ final class InspectorModel: ObservableObject {
   private func consume(_ row: RuntimeEvent) {
     timeline.append(row)
     if timeline.count > 300 { timeline.removeFirst(timeline.count - 300) }
+    if row.event == "provider.created", let id = row.provider, !id.isEmpty { providerRows[id] = row }
+    if row.event == "provider.apiKind", let id = row.provider, var configuration = providerRows[id] {
+      configuration.apiKind = row.apiKind
+      providerRows[id] = configuration
+    }
+    if row.event == "transaction.delivered", let id = row.transactionID, !id.isEmpty {
+      transactionRows[id] = row
+      let removable = transactionRows.values.sorted { $0.sequence > $1.sequence }.dropFirst(100)
+      for old in removable where !pending.values.contains(where: { $0.transactionID == old.transactionID }) {
+        if let oldID = old.transactionID { transactionRows.removeValue(forKey: oldID) }
+      }
+    }
     if row.event == "call.changed", let id = row.uuid {
       conversations[id] = row
       let ended = conversations.values.filter { $0.ended == true }.sorted { $0.sequence > $1.sequence }
@@ -197,14 +232,17 @@ final class InspectorModel: ObservableObject {
       } catch { commandError = error.localizedDescription }
     }
   }
-  func send(_ operation: String, call: RuntimeEvent, active: RuntimeEvent? = nil) {
-    guard !busy, online, let id = call.uuid else { return }
+  func send(_ operation: String, call: RuntimeEvent, active: RuntimeEvent? = nil, held: Bool? = nil, groupTarget: RuntimeEvent? = nil) {
+    guard !busy, online, let id = call.uuid, !isPending(call),
+          active.map({ !isPending($0) }) != false, groupTarget.map({ !isPending($0) }) != false else { return }
     busy = true
     Task {
       defer { busy = false }
       do {
         var command = ["operation": operation, "callUUID": id]
         if let activeID = active?.uuid { command["activeCallUUID"] = activeID }
+        if let held { command["held"] = held ? "true" : "false" }
+        if let targetID = groupTarget?.uuid { command["groupWithCallUUID"] = targetID }
         let response = try JSONDecoder().decode(ControlResult.self, from: await request("/command", body: command))
         if !response.success {
           throw NSError(domain: "Inspector", code: 3, userInfo: [NSLocalizedDescriptionKey: response.error ?? "Runtime rejected this call action."])

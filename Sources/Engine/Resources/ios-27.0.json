@@ -14,7 +14,7 @@
   "providerRouting": "newest-created",
   "waitingAnswer": "system-only",
   "transactionIdentity": "fresh-transaction-preserved-actions",
-  "scope": "Measured iOS 27.0 behavior; not a guarantee for other iOS releases.",
+  "scope": "Contains measured iOS 27.0 references and explicitly unverified simulator policies; not a guarantee for other iOS releases.",
   "postEndUnmuteSeconds": 0.08,
   "fulfilledPostEndUnmutePolicy": {
     "callkit": "timeout",
@@ -104,5 +104,37 @@
       ],
       "scope": "Unverified on device. NSError code follows the public incoming-call error identity; 2.07 s is explicit simulator policy borrowed from measured DND timing, not a measurement for this reason."
     }
+  },
+  "multiCall": {
+    "verification": "unverified",
+    "answerAudioActivationSeconds": 0.29,
+    "pauseAudioDeactivationSeconds": 0.09,
+    "resumeAudioActivationSeconds": 0.18,
+    "lastCallDeactivationSeconds": 0.1,
+    "remainingCallDeactivationSeconds": 1.15,
+    "handoffDeactivationSeconds": 0.12,
+    "handoffRecheckSeconds": 0.15,
+    "scope": "All multi-call timing and ordering are proposed simulator policy, unverified on the reference iPhone 13. Single-call observations do not qualify multi-call behavior.",
+    "groups": "Independent simulator group identifiers; a merge moves only the selected call, and unmerge creates its own group. LCK has no public group identifier.",
+    "capabilities": "Pausing, merging and unmerging mirror the reported capability flags. App requests without required capabilities use documented InvalidAction=6 as unverified simulator policy.",
+    "capacity": "Public configured limits constrain simulator mailbox merge/unmerge controls. Incoming admission limits and app-transaction capacity error mapping remain unverified and are not synthesized.",
+    "systemTransactions": {
+      "holdAndAccept": [
+        "hold(active,true)",
+        "answer(waiting)"
+      ],
+      "endAndAccept": [
+        "end(active)",
+        "answer(waiting)"
+      ],
+      "qualification": "Simulator composition and constituent ordering; LCK multi-call delivery, settlement, state and audio ordering remain unverified. Transaction IDs belong to the simulator; LCK exposes individual action callbacks."
+    },
+    "deviceNeeds": [
+      "Hold & Accept and End & Accept action/deadline/settlement/state/audio ordering",
+      "Pause/resume/swap and merge/unmerge both anchor and member; three-call selected-member moves",
+      "Group/member capacity 1x1,2x1,1x2,2x2: exact admission/action outcomes and capacity release",
+      "Pausing/merging/unmerging capability changes and direct app-action validation",
+      "Delayed, reversed, failed and expired composite constituents: partial effects and cancellation"
+    ]
   }
 }
