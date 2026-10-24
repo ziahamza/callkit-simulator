@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'discovery'))
-from build_sdk_device_release import inspect_standard_webrtc
+from build_sdk_device_release import inspect_livekit, inspect_standard_webrtc
 from device_release_exclusion import ExclusionError
 
 
@@ -59,6 +59,49 @@ class Controls(unittest.TestCase):
                 else:
                     (app / filename).write_bytes(plistlib.dumps({'VoIPSDK': {'mediaAdapter': 'none'}}))
             with self.assertRaises(ExclusionError): self.inspect(edit=edit)
+
+
+class LiveKitControls(unittest.TestCase):
+    def inspect(self, *, edit=None, symbols=None):
+        with tempfile.TemporaryDirectory(prefix='livekit-build-control-') as directory:
+            root = Path(directory); app = root / 'Example.app'; app.mkdir()
+            (app / 'Info.plist').write_bytes(plistlib.dumps({'VoIPSDK': {'mediaAdapter': 'livekit'}}))
+            (root / 'Podfile.properties.json').write_text(json.dumps({'ios-voip-sdk.mediaAdapter': 'livekit'}))
+            (root / 'Podfile.lock').write_text('PODS:\n  - livekit-react-native (3.1.0):\n'
+                '  - livekit-react-native-webrtc (150.1.0):\n  - LiveKitWebRTC (150.7871.03)\n')
+            images = {'Example': {}, 'Frameworks/LiveKitWebRTC.framework/LiveKitWebRTC': {}}
+            if edit: edit(root, app)
+            def run(command, **_):
+                self.assertEqual(command[:3], ['xcrun', 'nm', '-jU'])
+                defaults = {'Example': '_OBJC_CLASS_$_WebRTCModule\n',
+                            'LiveKitWebRTC': '_OBJC_CLASS_$_LKRTCAudioDeviceModule\n'}
+                return subprocess.CompletedProcess(command, 0,
+                    (symbols or defaults).get(Path(command[-1]).name, ''), '')
+            with patch('subprocess.run', side_effect=run), patch('subprocess.Popen', side_effect=AssertionError('native forbidden')):
+                return inspect_livekit(app, {'appBinaries': images}, root)
+
+    def test_actual_backend_build_remains_not_engine_acceptance(self):
+        result = self.inspect()
+        self.assertEqual(set(result['definedClassImages']), {'WebRTCModule', 'LKRTCAudioDeviceModule'})
+        self.assertIn('no execution or audio acceptance', result['qualification'])
+
+    def test_wrong_pin_opposite_provider_and_selection_fail(self):
+        for replacement in ('150.1.1', '150.2.0'):
+            def edit(root, app):
+                path = root / 'Podfile.lock'; path.write_text(path.read_text().replace('150.1.0', replacement))
+            with self.assertRaises(ExclusionError): self.inspect(edit=edit)
+        with self.assertRaises(ExclusionError):
+            self.inspect(edit=lambda root, app: (root / 'Podfile.lock').write_text(
+                (root / 'Podfile.lock').read_text() + '  - react-native-webrtc (155.0.1):\n'))
+        with self.assertRaises(ExclusionError):
+            self.inspect(edit=lambda root, app: (root / 'Podfile.properties.json').write_text(
+                json.dumps({'ios-voip-sdk.mediaAdapter': 'none'})))
+
+    def test_missing_or_duplicate_native_classes_fail(self):
+        for symbols in ({'Example': '_OBJC_CLASS_$_WebRTCModule\n'},
+                        {'Example': '_OBJC_CLASS_$_WebRTCModule\n_OBJC_CLASS_$_LKRTCAudioDeviceModule\n',
+                         'LiveKitWebRTC': '_OBJC_CLASS_$_LKRTCAudioDeviceModule\n'}):
+            with self.assertRaises(ExclusionError): self.inspect(symbols=symbols)
 
 
 if __name__ == '__main__':

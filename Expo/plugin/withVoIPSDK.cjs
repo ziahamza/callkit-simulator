@@ -62,8 +62,8 @@ function validate(options) {
     typeof settings.providerOwnershipMonitoring !== 'boolean'
   )
     fail('providerOwnershipMonitoring must be a boolean.');
-  if (!['webrtc', 'none'].includes(settings.mediaAdapter))
-    fail('mediaAdapter must be webrtc or none.');
+  if (!['webrtc', 'livekit', 'none'].includes(settings.mediaAdapter))
+    fail('mediaAdapter must be webrtc, livekit, or none.');
   if (!['fail', 'accept'].includes(settings.unhandledAction))
     fail('unhandledAction must be fail or accept.');
   for (const key of [

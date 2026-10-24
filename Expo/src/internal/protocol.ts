@@ -56,6 +56,7 @@ export type NativeEvents = {
 };
 
 export interface NativeBridge {
+  readonly mediaAdapter: 'webrtc' | 'livekit' | 'none';
   addListener<Name extends keyof NativeEvents>(
     name: Name,
     listener: NativeEvents[Name],

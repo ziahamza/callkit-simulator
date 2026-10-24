@@ -58,6 +58,53 @@ env:
   SIMCTL_CHILD_DYLD_INSERT_LIBRARIES: ""
 
 jobs:
+  expo-livekit-native:
+    name: Pinned Expo LiveKit selected Release device build
+    runs-on: xcode-27
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: "1"
+      EXPO_NO_TELEMETRY: "1"
+      SDK_EXAMPLE_MEDIA_ADAPTER: livekit
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: sudo xcode-select -s /Applications/Xcode_27.1.app
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "24.22.1"
+          package-manager-cache: false
+      - name: Check selection controls and prepare the pinned selected consumer
+        run: |
+          set -euo pipefail
+          python3 discovery/check_inherited_launcher_group.py
+          python3 Tests/ExpoMedia/check_standard_backend.py
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+          npm run typecheck
+          npm exec --workspace ios-voip-sdk-example -- expo prebuild --platform ios --no-install
+          (cd example/ios && pod install)
+      - name: Inspect the selected pod-built Release device app
+        run: >-
+          python3 discovery/build_sdk_device_release.py "$RUNNER_TEMP/expo-livekit-device"
+          --derived-data "$RUNNER_TEMP/expo-livekit-build/DerivedData" --livekit
+      - name: Preserve selected Release build inputs and inspection
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: expo-livekit-ios-27.1
+          path: |
+            ${{ runner.temp }}/expo-livekit-device/*.json
+            ${{ runner.temp }}/expo-livekit-device/*.log
+          if-no-files-found: error
+          retention-days: 7
+      - name: Remove this job's native build cache
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/expo-livekit-build/DerivedData"
   plain-simulator:
     runs-on: xcode-27
     timeout-minutes: 60

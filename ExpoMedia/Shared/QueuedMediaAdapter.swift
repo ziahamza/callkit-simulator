@@ -15,19 +15,30 @@ final class QueuedMediaAdapter: MediaAdapter {
 
   private func prepare(configureSession: Bool) async throws {
     let permit = AudioPreparationScope.permit
-    try AudioSessionQueue.checkCancellation()
-    try await complete { binding.prepare(check: { @Sendable in
-      do { try permit?.check(); return nil }
-      catch { return error as NSError }
-    }, configuration: { @Sendable in
+    while true {
+      try AudioSessionQueue.checkCancellation()
       do {
-        try permit?.check()
-        if configureSession { try AudioSessionConfiguration.applyOnAudioQueue(permit: permit) }
-        return nil
+        try await complete { binding.prepare(check: { @Sendable in
+          do { try permit?.check(); return nil }
+          catch { return error as NSError }
+        }, configuration: { @Sendable in
+          do {
+            try permit?.check()
+            if configureSession { try AudioSessionConfiguration.applyOnAudioQueue(permit: permit) }
+            return nil
+          }
+          catch { return error as NSError }
+        }, completion: $0) }
+        try AudioSessionQueue.checkCancellation()
+        return
+      } catch {
+        let failure = error as NSError
+        guard ExpoMediaSelection.name == "livekit", failure.domain == "VoIPSDK.MediaAdapter", failure.code == 1 else { throw error }
+        // Only registry readiness retries. The real action's permit/deadline
+        // and task cancellation bound this wait without blocking the audio queue.
+        try await Task.sleep(for: .milliseconds(50))
       }
-      catch { return error as NSError }
-    }, completion: $0) }
-    try AudioSessionQueue.checkCancellation()
+    }
   }
 
   func didActivate(_ audioSession: AVAudioSession) async throws {

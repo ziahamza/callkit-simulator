@@ -39,7 +39,7 @@ const configure = (options, config = {}) => {
 };
 
 test('default and explicit selection bind plist and pod property before native startup', () => {
-  for (const adapter of [undefined, 'webrtc', 'none']) {
+  for (const adapter of [undefined, 'webrtc', 'livekit', 'none']) {
     const result = configure(adapter === undefined ? undefined : { mediaAdapter: adapter });
     const expected = adapter ?? 'webrtc';
     assert.equal(result.info.VoIPSDK.mediaAdapter, expected);
@@ -59,8 +59,21 @@ test('selection preserves unrelated configuration and does not duplicate backgro
   assert.equal(result.entitlements.Other, true);
 });
 
-test('unlanded or malformed media selection fails instead of silently choosing a backend', () => {
-  for (const mediaAdapter of ['livekit', 'unknown', null, true, {}]) {
+test('unknown or malformed media selection fails instead of silently choosing a backend', () => {
+  for (const mediaAdapter of ['unknown', null, true, {}]) {
     assert.throws(() => configure({ mediaAdapter }), /mediaAdapter/);
+  }
+});
+
+test('example autolinking includes only the selected native WebRTC provider', () => {
+  const input = fs.readFileSync(path.join(root, 'example/react-native.config.js'), 'utf8');
+  for (const mediaAdapter of ['none', 'webrtc', 'livekit']) {
+    const config = { module: { exports: {} }, process: { env: { SDK_EXAMPLE_MEDIA_ADAPTER: mediaAdapter } } };
+    vm.runInNewContext(input, config);
+    const excluded = config.module.exports.dependencies;
+    assert.equal(excluded['react-native-webrtc']?.platforms.ios === null, mediaAdapter !== 'webrtc');
+    for (const name of ['@livekit/react-native', '@livekit/react-native-webrtc']) {
+      assert.equal(excluded[name]?.platforms.ios === null, mediaAdapter !== 'livekit');
+    }
   }
 });

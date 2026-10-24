@@ -1,0 +1,4 @@
+module livekit_react_native_webrtc {
+  header "LiveKitTestContract.h"
+  export *
+}

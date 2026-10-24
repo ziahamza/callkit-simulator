@@ -241,7 +241,6 @@ async function main() {
       { iconTemplateIos: false },
       { microphonePermission: '' },
       { defaultCallingApp: true },
-      { mediaAdapter: 'livekit' },
       { incomingCallTimeout: 45 },
       { typo: true },
     ]) {

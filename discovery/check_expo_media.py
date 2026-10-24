@@ -58,6 +58,7 @@ def main():
               ROOT / 'Sources/VoIPPlatform/include/VSAudioSessionQueue.h',
               ROOT / 'ExpoMedia/Shared/VSMediaBinding.h', ROOT / 'ExpoMedia/WebRTC/WebRTCAudioContract.h',
               ROOT / 'ExpoMedia/WebRTC/WebRTCMediaBinding.m',
+              ROOT / 'ExpoMedia/LiveKit/LiveKitMediaBinding.m',
               ROOT / 'ExpoMedia/Shared/QueuedMediaAdapter.swift',
               ROOT / 'Sources/VoIPSDK/MediaAdapter.swift', ROOT / 'Sources/VoIPSDK/AudioSessionQueue.swift',
               ROOT / 'Sources/VoIPSDK/AudioSessionConfiguration.swift', ROOT / 'Tests/AudioCore/AudioSessionFacade.swift',
@@ -65,7 +66,8 @@ def main():
     snapshot = lambda: {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs}
     before = snapshot()
     sdk = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True).strip()
-    cases = [('webrtc', 'ExpoMedia/WebRTC/WebRTCMediaBinding.m', 'WebRTCControls.m'),
+    cases = [('livekit', 'ExpoMedia/LiveKit/LiveKitMediaBinding.m', 'LiveKitControls.m'),
+             ('webrtc', 'ExpoMedia/WebRTC/WebRTCMediaBinding.m', 'WebRTCControls.m'),
              ('webrtc-absent', 'ExpoMedia/WebRTC/WebRTCMediaBinding.m', 'WebRTCAbsentControls.m')]
     results = {}
     with tempfile.TemporaryDirectory(prefix='ios-voip-expo-media-host-') as temporary:
