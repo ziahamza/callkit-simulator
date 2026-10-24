@@ -171,6 +171,30 @@ class ProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'PID changed'):
                 activate('device', 'test.fixture', 123, deadline=5)
 
+    def test_slow_foreground_activation_uses_available_consumer_budget(self):
+        activate = RUNNER['activate_existing']
+        self.elapsed[0] = 11.7  # Hosted failure had 13.3 s left in the 25 s lifetime.
+        def delayed_launch(*args, timeout):
+            if timeout < 6:
+                raise RuntimeError('launch timed out before foreground activation')
+            self.elapsed[0] += 6
+            return 'test.fixture: 123'
+        rpc = Mock(side_effect=delayed_launch)
+        with patch.dict(activate.__globals__, time=self.clock, run=rpc):
+            activate('device', 'test.fixture', 123, deadline=25)
+        self.assertEqual(rpc.call_count, 1)
+        self.assertLessEqual(rpc.call_args.kwargs['timeout'], 10)
+        self.assertAlmostEqual(self.elapsed[0], 17.7)
+
+    def test_foreground_timeout_does_not_extend_or_retry_the_global_budget(self):
+        activate = RUNNER['activate_existing']
+        rpc = Mock(side_effect=RuntimeError('launch timed out'))
+        with patch.dict(activate.__globals__, time=self.clock, run=rpc):
+            with self.assertRaisesRegex(RuntimeError, 'launch timed out'):
+                activate('device', 'test.fixture', 123, deadline=2)
+        self.assertEqual(rpc.call_count, 1)
+        self.assertEqual(rpc.call_args.kwargs['timeout'], 2)
+
     def test_native_journal_ignores_partial_tail_and_checks_session(self):
         channel = self.path.parent / 'channel'
         (channel / 'run').mkdir(parents=True)

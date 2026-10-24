@@ -26,7 +26,7 @@ Path(sys.argv[1], 'MediaAdapter.swift').write_text(adapter.replace(adapter_guard
 PY
 xcrun clang -fobjc-arc -fmodules -c Sources/VoIPPlatform/VSProcessSDKOwnership.m \
   -o "$TEST_OUTPUT/VSProcessSDKOwnership.o"
-for TEST_CASE in MuteEchoTests AudioAuthorityTests; do
+for TEST_CASE in MuteEchoTests WatchdogIntakeTests AudioAuthorityTests; do
   swiftc -swift-version 6 -warnings-as-errors -parse-as-library \
   -import-objc-header Sources/VoIPPlatform/include/VSProcessSDKOwnership.h \
   Sources/VoIPSDK/ConversationModels.swift Sources/VoIPSDK/ConversationRecord.swift \

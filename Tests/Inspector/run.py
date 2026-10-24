@@ -118,7 +118,8 @@ def remaining_budget(deadline):
 
 
 def activate_existing(device, bundle, pid, deadline):
-    output = run('xcrun', 'simctl', 'launch', device, bundle, timeout=min(5, remaining_budget(deadline)))
+    # Foregrounding shares the consumer lifetime, including hosted launch latency.
+    output = run('xcrun', 'simctl', 'launch', device, bundle, timeout=min(10, remaining_budget(deadline)))
     identities = [line.split(':', 1)[1].strip() for line in output.splitlines() if line.startswith(bundle + ':')]
     if identities != [str(pid)]:
         raise RuntimeError(f'Foreground activation PID changed for {bundle}: expected {pid}, got {output!r}')

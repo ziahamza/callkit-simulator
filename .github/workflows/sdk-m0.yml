@@ -7,6 +7,7 @@ on:
       - "Package.swift"
       - "VERSION"
       - "Sources/**"
+      - "Integrations/**"
       - "Tests/**"
       - "docs/research/callkit-simulator-probe/audio-session-lifecycle/2026-10-22-iphone13-ios27/device-trace.jsonl"
       - "docs/research/callkit-simulator-probe/audio-session-lifecycle/2026-10-22-iphone13-ios27-noio/device-trace.jsonl"
@@ -28,6 +29,7 @@ on:
       - "Package.swift"
       - "VERSION"
       - "Sources/**"
+      - "Integrations/**"
       - "Tests/**"
       - "docs/research/callkit-simulator-probe/audio-session-lifecycle/2026-10-22-iphone13-ios27/device-trace.jsonl"
       - "docs/research/callkit-simulator-probe/audio-session-lifecycle/2026-10-22-iphone13-ios27-noio/device-trace.jsonl"
@@ -166,6 +168,7 @@ jobs:
           python3 discovery/check_lck_provider_policy.py | tee "$SDK_M0_BUILD_LOGS/lck-policy-controls.json"
           bash Tests/VoIPSDK/run.sh | tee "$SDK_M0_BUILD_LOGS/core-controls.log"
           bash Tests/AudioSessionQueue/run.sh | tee "$SDK_M0_BUILD_LOGS/audio-queue-controls.log"
+          bash Tests/AudioCore/run.sh | tee "$SDK_M0_BUILD_LOGS/audio-watchdog-controls.log"
           python3 Tests/AudioLifecycle/check_audio_lifecycle.py | tee "$SDK_M0_BUILD_LOGS/audio-lifecycle-controls.log"
           python3 Tests/AudioLifecycle/check_audio_fixtures.py 2>&1 | tee "$SDK_M0_BUILD_LOGS/audio-raw-fixtures.log"
           python3 discovery/check_expo_media.py | tee "$SDK_M0_BUILD_LOGS/webrtc-facade-controls.log"
@@ -380,3 +383,37 @@ jobs:
       - name: Remove the downloaded app
         if: always()
         run: rm -rf "$RUNNER_TEMP/sdk-27-contract-build"
+
+  swift-livekit-native:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    env:
+      SDK_SWIFT_LIVEKIT_RUNTIME: com.apple.CoreSimulator.SimRuntime.iOS-27-0
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Select Xcode 27.1
+        run: sudo xcode-select -s /Applications/Xcode_27.1.app
+      - name: Check the focused engine acceptance gates
+        run: python3 discovery/check_swift_livekit.py
+      - name: Build a fresh pinned Swift consumer and notifier
+        run: python3 discovery/build_swift_livekit_contract.py "$RUNNER_TEMP/swift-livekit-build"
+      - name: Measure both real Swift engine modes on one owned simulator
+        run: python3 discovery/run_swift_livekit.py "$RUNNER_TEMP/swift-livekit-build" "$RUNNER_TEMP/swift-livekit-native"
+      - name: Preserve the source, pinned build and native captures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: swift-livekit-native-xcode-27.1
+          path: |
+            ${{ runner.temp }}/swift-livekit-build
+            ${{ runner.temp }}/swift-livekit-native
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove the owned build products
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/swift-livekit-build"
