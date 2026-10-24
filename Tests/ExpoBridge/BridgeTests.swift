@@ -339,7 +339,11 @@ struct BridgeTests {
     try expect(ownership?["type"] as? String == "providerOwnershipLost" &&
                (ownership?["payload"] as? [String: Any])?.isEmpty == true,
                "Process ownership loss must not invent a conversation identity.")
-
+    application.client.publish(.audioActivationMissing, conversationID: conversation.id)
+    let scoped = events.named("conversationEvent").last
+    try expect(scoped?["type"] as? String == "audioActivationMissing" &&
+               (scoped?["payload"] as? [String: Any])?["conversationId"] as? String == conversation.id.uuidString,
+               "A watchdog event must preserve its affected conversation identity.")
   }
 
   @MainActor private static func action(_ events: Events, id: UUID) throws -> [String: Any] {

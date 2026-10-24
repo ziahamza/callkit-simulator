@@ -14,7 +14,7 @@ from summarize import EvidenceError, load, one, require, successful_stop
 
 ROOT = Path(__file__).resolve().parent.parent
 CASES = ('healthy', 'profile', 'push-after-install')
-SOURCE_PATHS = ('Sources', 'Expo', 'ExpoMedia', 'example', 'Package.swift', 'IosVoipSDK.podspec',
+SOURCE_PATHS = ('Sources', 'Integrations', 'Expo', 'ExpoMedia', 'example', 'Package.swift', 'IosVoipSDK.podspec',
                 'expo-module.config.json', 'package.json', 'package-lock.json', 'tsconfig.json', 'VERSION',
                 'discovery/build_sdk_bootstrap.sh', 'discovery/build_sdk_device_probe.sh',
                 'discovery/probe/sdk_bootstrap.swift', 'discovery/run_sdk_m0.sh',
@@ -29,6 +29,8 @@ SOURCE_PATHS = ('Sources', 'Expo', 'ExpoMedia', 'example', 'Package.swift', 'Ios
                 'discovery/sdk_m1_contracts_conformance.py', 'discovery/check_sdk_m1_contracts.py',
                 'discovery/check_expo_bridge.py', 'discovery/check_expo_plugin.cjs',
                 'discovery/check_expo_media.py', 'discovery/check_expo_media_config.py',
+                'discovery/check_inherited_launcher_group.py',
+                'Tools/cksim-notify.c',
                 'discovery/check_platform_shims.py', 'discovery/check_sdk_ownership.py',
                 'discovery/check_push_delivery.py', 'discovery/check_push_report_entry.py',
                 'discovery/build_push_report_entry.sh', 'discovery/run_push_report_entry.py',
@@ -39,12 +41,13 @@ SOURCE_PATHS = ('Sources', 'Expo', 'ExpoMedia', 'example', 'Package.swift', 'Ios
                 'discovery/check_lck_provider_policy.py',
                 'Tools', 'scripts/build-runtime.sh', 'discovery/run_sdk_system.py',
                 'discovery/sdk_system_conformance.py', 'discovery/check_sdk_system.py',
-                'discovery/check_inherited_launcher_group.py',
                 'discovery/check_cli_controls.py', 'discovery/check_cli_push_launch.py',
                 'docs/research/callkit-simulator-probe/device-system-ui/2026-10-20-iphone13-ui10-app.jsonl',
                 'discovery/build_sdk_device_release.py', 'discovery/device_release_exclusion.py',
                 'discovery/check_device_release.py',
                 'discovery/sdk_m2_audio_lifecycle.py', 'discovery/check_sdk_m2_audio_lifecycle.py',
+                'discovery/build_swift_livekit_contract.py', 'discovery/run_swift_livekit.py',
+                'discovery/swift_livekit_conformance.py', 'discovery/check_swift_livekit.py',
                 'docs/research/callkit-simulator-probe/audio-session-lifecycle/2026-10-22-iphone13-ios27/device-trace.jsonl',
                 'docs/research/callkit-simulator-probe/audio-session-lifecycle/2026-10-22-iphone13-ios27-noio/device-trace.jsonl',
                 'docs/research/callkit-simulator-probe/livecommunicationkit')

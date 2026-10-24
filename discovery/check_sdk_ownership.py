@@ -70,7 +70,10 @@ def main():
         events = client[client.index('  @discardableResult\n  public func observeEvents'):client.index('  public func setConversationHandler')]
         emit_start = client.index('  private func emit(_ event: ConversationEvent,')
         emit = client[emit_start:client.index('\n  }', emit_start) + 4]
+        activation = (ROOT / 'Sources/VoIPSDK/AudioActivation.swift').read_text()
+        policy = activation[activation.index('public struct AudioActivationPolicy:'):activation.index('enum AudioActivationEvent:')]
         (out / 'Facades.swift').write_text('''import Foundation
+''' + policy + '''
 // Explicit platform facade: a coverage diagnostic is not a provider conflict.
 @MainActor enum ProviderCreationMonitor {
   static var conflict: (@MainActor () -> Void)?
@@ -102,10 +105,11 @@ def main():
   static var onTrack: (@MainActor () -> Void)?
   private let configuration: Configuration
   private let mediaAdapter: any MediaAdapter
+  private let audioPolicy: AudioActivationPolicy
   private var launchFinished = false
   private var eventObservers: [UUID: @MainActor (ConversationEventContext) -> Void] = [:]
-  private init(configuration: Configuration, mediaAdapter: any MediaAdapter) {
-    self.configuration = configuration; self.mediaAdapter = mediaAdapter
+  private init(configuration: Configuration, mediaAdapter: any MediaAdapter, audioPolicy: AudioActivationPolicy) {
+    self.configuration = configuration; self.mediaAdapter = mediaAdapter; self.audioPolicy = audioPolicy
     Self.creations += 1 // Explicit facade for constructing the LCK manager.
   }
   var selectedAdapterForHost: any MediaAdapter { mediaAdapter }
@@ -188,6 +192,13 @@ def main():
     }
     do {
       _ = try ConversationClient.forApplication(configuration: configuration.client, mediaAdapter: conflictingAdapter)
+      return false
+    } catch {
+      guard (error as? ConversationClientError) == .alreadyConfigured else { return false }
+    }
+    do {
+      _ = try VoIPApplication.start(configuration: configuration, mediaAdapter: adapter,
+        audioPolicy: AudioActivationPolicy(activationTimeout: 12, recoveryTimeout: 6))
       return false
     } catch {
       guard (error as? ConversationClientError) == .alreadyConfigured else { return false }

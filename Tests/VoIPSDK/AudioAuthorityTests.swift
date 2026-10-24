@@ -17,17 +17,19 @@ import Foundation
 }
 
 @main struct AudioAuthorityTests {
-  @MainActor static func wait(_ condition: () -> Bool) async throws {
+  @MainActor static func wait(_ condition: () -> Bool,
+                             message: String = "Host audio authority boundary timed out") async throws {
     let limit = ContinuousClock.now + .seconds(2)
     while !condition() {
-      precondition(ContinuousClock.now < limit, "Host audio authority boundary timed out")
+      precondition(ContinuousClock.now < limit, message)
       try await Task.sleep(for: .milliseconds(1))
     }
   }
 
   @MainActor static func main() async throws {
     let adapter = RecordingAudioAdapter()
-    let client = try ConversationClient.forApplication(configuration: .init(), mediaAdapter: adapter)
+    let policy = try AudioActivationPolicy(activationTimeout: 0.05, recoveryTimeout: 0.05)
+    let client = try ConversationClient.forApplication(configuration: .init(), mediaAdapter: adapter, audioPolicy: policy)
     client.finishLaunch()
     let manager = ConversationManager.latest!, system = SystemAudioSession.latest!
     let session = AVAudioSession()
@@ -94,6 +96,117 @@ import Foundation
     precondition(!adapter.authorized && !system.authorized, "Reset revocation survives advisory notifications")
     precondition(events.allSatisfy { $0.conversationID == nil }, "Process-wide events cannot invent a conversation ID")
 
-    print("{\"success\":true,\"actualClientAudioAuthority\":true,\"nativeFrameworkMeasured\":false}")
+    func failedReportCount(_ id: UUID) -> Int {
+      manager.reports.filter { pair in
+        if case .conversationEnded(_, .failed) = pair.1 { return pair.0 == id }
+        return false
+      }.count
+    }
+    func watchdogEvents(_ id: UUID) -> [ConversationEvent] {
+      events.filter { $0.conversationID == id &&
+        ($0.type == .audioActivationMissing || $0.type == .audioActivationFailed) }.map(\.type)
+    }
+
+    // Replacing an object in either watchdog event starts a new absence for that
+    // object. The old event/timer must neither end it nor suppress its watchdog.
+    for trigger in [ConversationEvent.audioActivationMissing, .audioActivationFailed] {
+      client.conversationManagerDidReset(manager)
+      client.setConversationHandler(.init(join: { _, _ in }, start: { _, _ in }, end: { _, _ in }))
+      activate()
+      let id = try await client.reportIncomingConversation(.init(eventId: "observer-" + trigger.rawValue,
+        serverCallId: "observer-" + trigger.rawValue, caller: .init(id: "host-audio-caller")))
+      try await client.joinConversation(id)
+      let original = manager.conversations.first { $0.uuid == id }!
+      var replacement: Conversation?
+      var replacedAt: ContinuousClock.Instant?
+      var replacementMissing = false
+      onEvent = { event in
+        guard event.conversationID == id else { return }
+        if replacement == nil && event.type == trigger {
+          let current = Conversation(id, state: .joined)
+          replacement = current; replacedAt = .now
+          manager.conversations = [current]
+          client.conversationManager(manager, conversationChanged: current)
+        } else if replacement != nil && event.type == .audioActivationMissing {
+          precondition(ContinuousClock.now - replacedAt! >= .milliseconds(50),
+            "A replacement must receive its full activation interval")
+          precondition(replacement?.state == .joined && failedReportCount(id) == 0 &&
+            client.incomingIntake.projection(id)?.terminal == nil,
+            "The original episode must leave the replacement and its intake live")
+          replacementMissing = true
+        } else if replacement != nil && event.type == .audioActivationFailed {
+          precondition(replacementMissing,
+            "A replacement must reach its own missing deadline before failure")
+          precondition(ContinuousClock.now - replacedAt! >= .milliseconds(100),
+            "A replacement must receive its full activation and recovery intervals")
+        }
+      }
+      deactivate()
+      try await wait({ replacement?.state == .left },
+        message: "An observer's same-UUID replacement must finish its own bounded watchdog")
+      onEvent = nil
+      let expected: [ConversationEvent] = trigger == .audioActivationMissing
+        ? [.audioActivationMissing, .audioActivationMissing, .audioActivationFailed]
+        : [.audioActivationMissing, .audioActivationFailed, .audioActivationMissing, .audioActivationFailed]
+      precondition(watchdogEvents(id) == expected && failedReportCount(id) == 1 && original.state == .joined,
+        "Only the replacement's own episode may report its end; the original object stays untouched")
+      precondition(client.incomingIntake.projection(id)?.terminal?.ended.reason == .failed,
+        "The replacement's actual failed end must reach the canonical intake")
+    }
+
+    // Pending application cancellation can synchronously restore real LCK
+    // authority or replace the current object. Neither permits a stale failed
+    // end report or terminal metadata from the watchdog's older decision.
+    for suffix in ["activation", "replacement"] {
+      client.conversationManagerDidReset(manager)
+      var pending: CheckedContinuation<Void, any Error>?
+      var reentered = false
+      var callID: UUID?
+      var replacement: Conversation?
+      client.setConversationHandler(.init(join: { _, _ in }, start: { _, _ in }, end: { _, _ in },
+        mute: { _, context in
+          context.signal.observe { _ in
+            reentered = true
+            if suffix == "replacement" {
+              let current = Conversation(callID!, state: .joined)
+              replacement = current
+              manager.conversations = [current]
+              client.conversationManager(manager, conversationChanged: current)
+            } else { activate() }
+          }
+          try await withCheckedThrowingContinuation { pending = $0 }
+        }))
+      let id = try await client.reportIncomingConversation(.init(eventId: "reentrant-" + suffix,
+        serverCallId: "reentrant-" + suffix, caller: .init(id: "host-audio-caller")))
+      callID = id
+      // Keep modeled LCK authority through setup, so scheduler delay cannot
+      // race the watchdog before its cancellation observer exists.
+      activate()
+      try await client.joinConversation(id)
+      let original = manager.conversations.first { $0.uuid == id }!
+      let mute = MuteConversationAction(conversationUUID: id, isMuted: true)
+      manager.deliver(mute)
+      try await wait { pending != nil }
+      deactivate() // Only now begin the absence episode under test.
+      try await wait { reentered }
+      precondition(!manager.reports.contains { pair in
+        if case .conversationEnded(_, .failed) = pair.1 { return pair.0 == id }
+        return false
+      }, "A newer authority/object must prevent the stale native failed-end report")
+      precondition(client.snapshots.first(where: { $0.id == id })?.ended == nil &&
+        client.incomingIntake.projection(id)?.terminal == nil,
+        "Skipping a stale native end must also preserve live metadata and the canonical intake")
+      pending?.resume(throwing: CancellationError()); pending = nil
+      if suffix == "replacement" {
+        try await wait({ replacement?.state == .left },
+          message: "A cancellation replacement must not inherit the original failed marker")
+        precondition(watchdogEvents(id) == [.audioActivationMissing, .audioActivationFailed,
+          .audioActivationMissing, .audioActivationFailed] && failedReportCount(id) == 1 && original.state == .joined,
+          "A cancellation replacement must get its own watchdog and exactly one end for its current object")
+        precondition(client.incomingIntake.projection(id)?.terminal?.ended.reason == .failed,
+          "The cancellation replacement's bounded failure must update canonical intake")
+      } else { try await client.reportConversation(id, report: .ended(.remoteEnded)) }
+    }
+    print("{\"success\":true,\"groups\":10,\"actualClientAuthorityAndWatchdog\":true,\"nativeFrameworkMeasured\":false}")
   }
 }
