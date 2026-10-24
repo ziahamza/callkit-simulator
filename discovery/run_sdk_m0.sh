@@ -20,7 +20,16 @@ OUT=$(cd "$OUT" && pwd)
 UDID=""
 INHERITED_DYLD=""
 RUN_ID=$(uuidgen)
-limit() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+limit() {
+  local seconds=$1 status=0
+  shift
+  printf 'SDK infrastructure start (%ss):' "$seconds" >&2
+  printf ' %q' "$@" >&2
+  printf '\n' >&2
+  perl -e 'alarm shift; exec @ARGV' "$seconds" "$@" || status=$?
+  printf 'SDK infrastructure exit: %s\n' "$status" >&2
+  return "$status"
+}
 cleanup_simulator() {
   [[ -n "$UDID" ]] || return 0
   local shutdown_status=0 delete_status=0
@@ -155,16 +164,6 @@ PY
 fi
 limit 180 xcrun simctl install "$UDID" "$SDK_M0_APP" > "$OUT/example-install.log" 2>&1
 limit 180 xcrun simctl install "$UDID" "$SDK_M0_BOOTSTRAP_APP" > "$OUT/bootstrap-install.log" 2>&1
-INSTALLED_APP=$(limit 20 xcrun simctl get_app_container "$UDID" dev.iosvoipsdk.example app)
-INSTALLED_BOOTSTRAP=$(limit 20 xcrun simctl get_app_container "$UDID" dev.callkitsim.sdkbootstrap app)
-python3 - "$OUT/installed.json" "$INSTALLED_APP" "$INSTALLED_BOOTSTRAP" <<'PY'
-import hashlib,json,pathlib,plistlib,sys
-def executable(bundle): return bundle/plistlib.loads((bundle/'Info.plist').read_bytes())['CFBundleExecutable']
-def digest(path): return hashlib.sha256(path.read_bytes()).hexdigest()
-app,bootstrap=map(pathlib.Path,sys.argv[2:])
-pathlib.Path(sys.argv[1]).write_text(json.dumps(dict(example=digest(executable(app)),
-    bootstrap=digest(executable(bootstrap)),javascript=digest(app/'main.jsbundle')),indent=2)+'\n')
-PY
 # Plain --console preserves the app streams. The raw host PTY only flushes
 # the launcher's stdio; --console-pty interleaved its PID header into PROBE JSON.
 env SIMCTL_CHILD_DYLD_INSERT_LIBRARIES="$INHERITED_DYLD" SIMCTL_CHILD_SDK_M0_ACCEPTANCE=1 \
@@ -181,6 +180,9 @@ for case in healthy profile push-after-install; do
     --terminate-command xcrun simctl terminate "$UDID" dev.callkitsim.sdkbootstrap \
     --launch-command xcrun simctl launch --console --terminate-running-process "$UDID" dev.callkitsim.sdkbootstrap
 done
+# Each app publishes its canonical bundle URL. Bind it to the completed launch
+# before reading installed bytes; avoid the two pre-launch CoreSimulator RPCs.
+python3 discovery/sdk_installed_paths.py "$OUT" "$RUN_ID" "$UDID"
 if [[ "${SDK_M1_ACCEPTANCE:-0}" == 1 ]]; then
   mkdir "$OUT/m1"
   # Reuse the first observed data container across relaunches of this installation.

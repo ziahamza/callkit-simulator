@@ -49,7 +49,8 @@ public final class VoIPExampleAppDelegateSubscriber: ExpoAppDelegateSubscriber {
     JourneyTrace.record("app.entry")
     JourneyTrace.record("launch", ["traceVersion": 2,
       "mode": !JourneyConfiguration.systemCase.isEmpty ? "sdk-system" : JourneyTrace.m0 ? "sdk-m0" : "sdk-m1",
-      "case": JourneyConfiguration.systemCase.isEmpty ? JourneyTrace.m1Case : JourneyConfiguration.systemCase])
+      "case": JourneyConfiguration.systemCase.isEmpty ? JourneyTrace.m1Case : JourneyConfiguration.systemCase,
+      "bundlePath": Bundle.main.bundleURL.resolvingSymlinksInPath().path])
     if !JourneyConfiguration.systemCase.isEmpty { ExampleJourney.shared.startSystem() }
     if ["cold-launch", "unhandled-expiry"].contains(JourneyTrace.m1Case) {
       ExampleJourney.shared.startColdLaunch()

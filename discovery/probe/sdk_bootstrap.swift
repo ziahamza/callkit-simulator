@@ -38,7 +38,8 @@ final class SDKBootstrapProbe: NSObject, UIApplicationDelegate {
     let runtimeInjected = inserted.contains { entry in
       ["CKSimRuntime.dylib", "CKSimLoader.dylib"].contains(URL(fileURLWithPath: String(entry)).lastPathComponent)
     }
-    Self.trace("launch", ["mode": mode, "injected": runtimeInjected])
+    Self.trace("launch", ["mode": mode, "injected": runtimeInjected,
+      "bundlePath": Bundle.main.bundleURL.resolvingSymlinksInPath().path])
     check(!CKSimRuntimeIsActive(), "explicit-activation-required")
     let provider = CXProvider(configuration: CXProviderConfiguration())
     let controller = CXCallController(queue: .main)

@@ -57,7 +57,7 @@ permissions:
 
 concurrency:
   group: sdk-m0-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # Owned CI apps need no injection; local unset values still preserve launchd.
@@ -147,6 +147,7 @@ jobs:
           } >> "$GITHUB_ENV"
           mkdir -p "$SDK_M0_BUILD_ROOT" "$SDK_M0_BUILD_LOGS"
           python3 discovery/check_sdk_m0.py | tee "$SDK_M0_BUILD_LOGS/offline-controls.json"
+          python3 discovery/check_sdk_installed_paths.py
           python3 discovery/check_sdk_m1.py 2>&1 | tee "$SDK_M0_BUILD_LOGS/m1-offline-controls.log"
           python3 discovery/check_sdk_m1_contracts.py 2>&1 | tee "$SDK_M0_BUILD_LOGS/m1-contract-controls.log"
           python3 discovery/check_sdk_m1_container_capture.py 2>&1 | tee "$SDK_M0_BUILD_LOGS/m1-container-controls.log"
