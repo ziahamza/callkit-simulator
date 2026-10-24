@@ -67,6 +67,62 @@ private struct IncomingReportOutcome: Sendable {
     domain = code == 0 ? "" : "com.apple.CallKit.error.incomingcall"
   }
 }
+// iPhone 13 / iOS 27.0, #85. LCK exposes no group membership or transaction IDs.
+private struct LCKMultiCallPolicy {
+  enum Kind { case join, pause, resume, end, merge, other }
+  enum Failure { case endWithCleanup, endRegardless, none }
+  static func failure(_ kind: Kind) -> Failure {
+    switch kind { case .join, .pause: .endWithCleanup; case .end: .endRegardless; default: .none }
+  }
+  static func choices(established: Int, held: Int, active: Int, maximumGroups: Int) -> [String] {
+    if established == 0 { return ["answer", "decline"] }
+    guard active == 1 else { return [] } // This configuration was not measured.
+    var result = ["end-and-accept", "decline"]
+    if maximumGroups >= 2 && established < maximumGroups { result.insert("hold-and-accept", at: 0) }
+    if held > 0 { result.append("end-held-and-accept") }
+    return result
+  }
+  static func canStart(established: Int, reservedStarts: Int, maximumGroups: Int) -> Bool {
+    established + reservedStarts < maximumGroups
+  }
+  static func shouldEndActiveOnResume(maximumGroups: Int, maximumPerGroup: Int) -> Bool {
+    maximumGroups == 2 && maximumPerGroup == 1
+  }
+  static func resumeEndDelay(nominal: Double, elapsedSinceIssued: Double) -> Double {
+    max(0, nominal - elapsedSinceIssued)
+  }
+  static func usesCompositeBarrier(system: Bool, actionCount: Int, joiningCount: Int) -> Bool {
+    system && actionCount > 1 && joiningCount > 0
+  }
+  struct Handoff {
+    private var gapElapsed = false
+    private var joined = false
+    mutating func markGapElapsed() -> Bool { gapElapsed = true; return joined }
+    mutating func markJoined() -> Bool { joined = true; return gapElapsed }
+  }
+  struct Barrier {
+    private var remaining: Set<UUID>
+    private let joining: [UUID: UUID]
+    private var failed = Set<UUID>()
+    init(actions: [UUID], joining: [UUID: UUID]) { remaining = Set(actions); self.joining = joining }
+    mutating func settle(_ action: UUID, fulfilled: Bool) -> [UUID]? {
+      guard remaining.remove(action) != nil else { return nil }
+      if !fulfilled { failed.insert(action) }
+      guard remaining.isEmpty else { return nil }
+      return joining.filter { !failed.contains($0.key) }.map(\.value)
+    }
+  }
+}
+private struct LCKMultiCallProfile: Decodable {
+  let pauseEndExpirySeconds: Double
+  let joinExpirySeconds: Double
+  let cleanupEndExpirySeconds: Double
+  let pausedAfterDeliverySeconds: Double
+  let joinedAfterSettlementSeconds: Double
+  let audioHandoffGapSeconds: Double
+  let audioDeactivationAfterDeliverySeconds: Double
+  let appResumeEndDelaySeconds: Double
+}
 private struct BehaviorProfile: Decodable {
   let id: String
   let schemaVersion: Int
@@ -78,6 +134,7 @@ private struct BehaviorProfile: Decodable {
   let answerDeadlineSeconds: Double
   let ordinaryDeadlineSeconds: Double
   let lckActionDeadlineSeconds: Double
+  let lckMultiCall: LCKMultiCallProfile
   let reportLatencySeconds: Double
   let pushReportDeadlineSeconds: Double
   let incomingFilterPolicies: [String: IncomingFilterPolicy]
@@ -85,9 +142,10 @@ private struct BehaviorProfile: Decodable {
   let postEndUnmuteSeconds: Double
   let fulfilledPostEndUnmutePolicy: FulfilledPostEndUnmutePolicy
 
-  func timing(api: ProviderAPIKind, answer: Bool, start: Bool) -> (deadline: Double, expiry: Double) {
+  func timing(api: ProviderAPIKind, answer: Bool, start: Bool, pauseOrEnd: Bool = false) -> (deadline: Double, expiry: Double) {
     if api == .livecommunicationkit {
-      return (lckActionDeadlineSeconds, lckActionDeadlineSeconds)
+      return (lckActionDeadlineSeconds, answer ? lckMultiCall.joinExpirySeconds :
+        pauseOrEnd ? lckMultiCall.pauseEndExpirySeconds : lckActionDeadlineSeconds)
     }
     if answer { return (answerDeadlineSeconds, answerExpirySeconds) }
     if start { return (startDeadlineSeconds, startDeadlineSeconds) }
@@ -112,6 +170,7 @@ private final class CallState: @unchecked Sendable {
   var outgoing = false
   var connected = false
   var held = false
+  var holdRevision: UInt64 = 0
   var ended = false
   var muted = false
   var group: UUID
@@ -125,7 +184,24 @@ private final class CallState: @unchecked Sendable {
   }
 }
 
-private enum ActionOrigin: String { case application, system, muteEcho, postEndUnmute }
+private enum ActionOrigin: String { case application, system, muteEcho, postEndUnmute, failureCleanup }
+private final class LCKRuntimeComposite: @unchecked Sendable {
+  var barrier: LCKMultiCallPolicy.Barrier
+  let joining: [UUID: CallState]
+  let joiningRevisions: [UUID: UInt64]
+  let systemComposite: Bool
+  init(_ actions: [CXAction], calls: [UUID: CallState], origin: ActionOrigin) {
+    var joiningActions: [UUID: UUID] = [:]
+    var bindings: [UUID: CallState] = [:]
+    for case let action as CXCallAction in actions where action is CXAnswerCallAction || (action as? CXSetHeldCallAction)?.isOnHold == false {
+      if let call = calls[action.callUUID] { joiningActions[action.uuid] = call.id; bindings[call.id] = call }
+    }
+    barrier = LCKMultiCallPolicy.Barrier(actions: actions.map(\.uuid), joining: joiningActions)
+    joining = bindings; joiningRevisions = bindings.mapValues(\.holdRevision)
+    systemComposite = LCKMultiCallPolicy.usesCompositeBarrier(system: origin == .system,
+      actionCount: actions.count, joiningCount: bindings.count)
+  }
+}
 private final class RuntimePendingAction: @unchecked Sendable {
   let action: CXAction
   let provider: ProviderRegistration
@@ -135,14 +211,16 @@ private final class RuntimePendingAction: @unchecked Sendable {
   let generation: UInt64
   let call: CallState?
   let groupTarget: CallState?
+  let lckComposite: LCKRuntimeComposite?
   let issuedAt = Date()
   let issuedUptime = DispatchTime.now().uptimeNanoseconds
   var expired = false
   var settled = false
-  init(_ action: CXAction, _ provider: ProviderRegistration, _ transaction: CXTransaction, _ origin: ActionOrigin, call: CallState?, groupTarget: CallState?) {
+  init(_ action: CXAction, _ provider: ProviderRegistration, _ transaction: CXTransaction, _ origin: ActionOrigin, call: CallState?, groupTarget: CallState?, lckComposite: LCKRuntimeComposite?) {
     self.action = action; self.provider = provider; self.transaction = transaction; self.origin = origin
     self.apiKind = provider.apiKind
     self.generation = provider.generation; self.call = call; self.groupTarget = groupTarget
+    self.lckComposite = lckComposite
   }
 }
 
@@ -181,6 +259,9 @@ private struct Command: Decodable {
   let operation: String
   var callUUID: UUID?
   var activeCallUUID: UUID?
+  var heldCallUUID: UUID?
+  var groupWithCallUUID: UUID?
+  var applicationRequest: Bool?
   var held: Bool?
   var muted: Bool?
   var digits: String?
@@ -313,6 +394,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
   private var audioActive = false
   private var audioRevision: UInt64 = 0
   private var handoffPending = false
+  private var lckHandoff = LCKMultiCallPolicy.Handoff()
   private var faults = Faults()
   private var incomingFilter: IncomingFilterReason = .none
   private let runID: String
@@ -335,7 +417,11 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
     profile = try JSONDecoder().decode(BehaviorProfile.self, from: Self.profileData(profileID))
     let durations = [profile.answerExpirySeconds, profile.ringTimeoutSeconds, profile.unknownProviderSeconds,
       profile.actionTimeoutSeconds, profile.startDeadlineSeconds, profile.answerDeadlineSeconds,
-      profile.ordinaryDeadlineSeconds, profile.lckActionDeadlineSeconds, profile.pushReportDeadlineSeconds, profile.reportLatencySeconds, profile.muteEchoSeconds, profile.postEndUnmuteSeconds]
+      profile.ordinaryDeadlineSeconds, profile.lckActionDeadlineSeconds, profile.pushReportDeadlineSeconds, profile.reportLatencySeconds, profile.muteEchoSeconds, profile.postEndUnmuteSeconds,
+      profile.lckMultiCall.pauseEndExpirySeconds, profile.lckMultiCall.joinExpirySeconds,
+      profile.lckMultiCall.cleanupEndExpirySeconds, profile.lckMultiCall.pausedAfterDeliverySeconds,
+      profile.lckMultiCall.joinedAfterSettlementSeconds, profile.lckMultiCall.audioHandoffGapSeconds,
+      profile.lckMultiCall.audioDeactivationAfterDeliverySeconds, profile.lckMultiCall.appResumeEndDelaySeconds]
     guard profile.schemaVersion == 1 && profile.id == profileID && durations.allSatisfy({ $0.isFinite && $0 > 0 }) else {
       throw BootstrapError.invalid("invalid behavior profile")
     }
@@ -438,7 +524,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
   "lckActionDeadlineSeconds": 30,
   "lckActionDeadlineEvidence": {
     "measured": "24 lck.perform timeoutDate samples are 30 seconds. cx-after has no LCK deliveries; its later CX provider owns the actions.",
-    "expiryPolicy": "Proposed runtime expiry at the advertised LCK deadline; unfulfilled LCK expiry timing was not measured by these captures.",
+    "expiryPolicy": "The advertised LCK timeoutDate remains 30 seconds. #85 measured effective Pause/End expiry near 5.3 s and Join expiry near 64 s in system waiting-call composites; see lckMultiCall. Runtime expiry at 30 s for other LCK action kinds remains unverified.",
     "captures": {
       "docs/research/callkit-simulator-probe/livecommunicationkit/2026-10-21-iphone13-ios27-lck-basic.jsonl": {
         "sha256": "9fd5e48b62a826af7e62388de87119ab431fe2019a7d40445cdd9b528dde4bf7",
@@ -456,6 +542,65 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
         "sha256": "23ab443e1fd8623140e95cc7d34157d5fd8aa7d13b6321f90e1812825f65a042",
         "samples": 4
       }
+    }
+  },
+  "lckMultiCall": {
+    "pauseEndExpirySeconds": 5.3,
+    "joinExpirySeconds": 64,
+    "cleanupEndExpirySeconds": 5.2,
+    "pausedAfterDeliverySeconds": 0.11,
+    "joinedAfterSettlementSeconds": 0.115,
+    "audioHandoffGapSeconds": 0.213,
+    "audioDeactivationAfterDeliverySeconds": 0.12,
+    "appResumeEndDelaySeconds": 0.091,
+    "apiKind": "livecommunicationkit",
+    "verification": "measured",
+    "reference": "#85; iPhone 13 / iOS 27.0 (24A5355q); October 24, 2026",
+    "source": "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/README.md",
+    "timingInterpretation": "Representative runtime samples and aggregate medians, not minimum delays or guaranteed bounds. Join median 115 ms (9\u2013239 ms); audio gap median 213 ms (151\u2013404 ms without delayed constituents). Pause 110 ms and deactivation 120 ms are representative delivery-relative samples; resume-generated End 91 ms is relative to Resume delivery.",
+    "evidence": {
+      "systemComposite": "Constituents of 28 system waiting-call composites arrived within 0\u20133 ms. Accepted Join followed every constituent terminal settlement; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/README.md; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-delay-pause.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-reverse.jsonl.",
+      "pauseBeforeFulfillment": "Pause state appeared about 110 ms after delivery while Pause remained unfulfilled for 2 s; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-delay-pause.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-pending-pause.jsonl.",
+      "effectiveExpiry": "timeoutDate advertised 30 s; Pause/End timedOut near 5.3 s, Join near 64 s; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-pending-pause.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ea-pending-end.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-pending-join.jsonl.",
+      "failedPause": "Failed Pause ended A and delivered cleanup End A; B joined; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-fail-pause.jsonl.",
+      "failedJoin": "Failed Join ended B and delivered cleanup End B while A stayed paused; End & Accept lost both calls; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-fail-join.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ea-fail-join.jsonl.",
+      "failedEnd": "Failed End was ignored: A left and B joined, without retry. Pending End expiry was terminal too; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ea-fail-end.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ea-pending-end.jsonl.",
+      "cleanupEnd": "Cleanup End arrived after the conversation had left. Immediate fulfillment still produced timedOut about 5.2 s later; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-fail-pause.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-pending-join.jsonl.",
+      "noAutomaticResume": "Ending B left A paused until the application acted; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/hold-accept.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-fail-join.jsonl.",
+      "choices": "Hold & Accept required maximumConversationGroups >= 2 and a free group. Full groups offered End & Accept, Decline and End Held & Accept; merging did not free a group. End Held & Accept delivered Pause B, End A and Join C; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/cap-1x1.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/cap-1x2.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/cap-2x2.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/third-end-held-accept.jsonl.",
+      "outgoingCapacity": "Outgoing Start at capacity returned com.apple.CallKit.error.requesttransaction 7 after 11\u2013206 ms; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/cap-1x1.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/cap-1x2.jsonl.",
+      "capabilities": "No capabilities, or removing pausing mid-call, gated neither waiting choices nor app Pause; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/caps-none.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/caps-toggle.jsonl.",
+      "mergeAndUnmerge": "App Merge/Unmerge were accepted and delivered without conversation state changes, including singleton Unmerge and Merge into a ringing target. LCK exposes no group membership; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/merge-b-into-a.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/merge-a-into-b.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/unmerge-singleton.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/cap-2x1.jsonl.",
+      "appResume": "With 2x1, app Resume A joined A, then a distinct generated End B arrived 91 ms after Resume delivery. Shared transaction composition was not observable; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/swap-app.jsonl.",
+      "audioAndQueue": "Callbacks arrived on main; normal composites deactivated then activated audio with aggregate median 213 ms. The 120 ms deactivation sample is representative, not an aggregate median; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/README.md; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-delay-pause.jsonl; docs/research/callkit-simulator-probe/livecommunicationkit/multicall/hold-accept.jsonl."
+    },
+    "unverified": [
+      "Genuine CallKit multi-call state, choices, capability gating, failures and capacity behavior; these LCK measurements must not replace CallKit policy.",
+      "Concrete CXTransaction identifiers and action grouping; LCK exposes neither transaction identifiers nor group membership.",
+      "Application-authored composite pause/resume transactions and system UI Swap.",
+      "Per-group application-owned media/group membership effects, and capacity admission errors beyond the measured outgoing Start code 7.",
+      "Expiry of LCK actions other than Pause, End and Join; 30 s remains a proposed expiry for those kinds.",
+      "Delayed or failed app Resume ordering and generated-End timing beyond the immediately fulfilled 2x1 swap-app capture; runtime scheduling remains gated on successful settlement."
+    ],
+    "captureSHA256": {
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/hold-accept.jsonl": "4699c4f9140d9956bcaef84cb2f6075e4af7c6e643bc971f3a25551ecf01c802",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-delay-pause.jsonl": "a4395a1f5541f33b8d2b586cd59e93a5fbcdbe305a91c38d4b0ae7735758523b",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-reverse.jsonl": "e6f97e8e97fd397b265ec4c4bd59968904af61ac1b6c4b95b4bcad14d122ac61",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-fail-pause.jsonl": "31c9c2b054d8121c13488a50073988cd5a18de4a617751756ac8e46b97074a9e",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-fail-join.jsonl": "96836e3ab962169664179b7edc24855a4e79383e0ed1b97ddbe1858e69f70868",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-pending-pause.jsonl": "d30c7ae4c6c44b27c53fb640c22abbd61d8275417f9a5c0463a3b18393c2ada0",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ha-pending-join.jsonl": "97fb4cfb4fc42f80f4a452703ebffdb5b2fcb6a8ed41b2adbf88bf4b044bbb86",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ea-fail-end.jsonl": "f7a4a400406e8b7fcd34da575434856c6e8bd6e418e08232266fcc39a50a9344",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/ea-pending-end.jsonl": "5d7282b8e932fc2f74a8971eaf16c2f51a0117fdf79e67afe9ca4f83f49cea43",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/cap-1x1.jsonl": "6ea3e1ef43ea4d8e02f832004d4fd67915a9ec9f86f91b8c2e9a2c4083b6bcc9",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/cap-1x2.jsonl": "d96893e01c93b31f1a23c343d83b3f37ffb9839a367b55dc5b3f4f53bc5a2264",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/cap-2x2.jsonl": "e048fb999dddfd6bbd6898c0e4ebf140b8d3e34845f6de74ba43b92022f52159",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/caps-none.jsonl": "a7df6193aa821cfddecb01846f9b648d0328b251a65296f2a7610c6b81623902",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/caps-toggle.jsonl": "8a9777bf1fa181e1ca23f1c25cd97f8a6b91882a7175bc1b86cf8524042190fe",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/merge-b-into-a.jsonl": "92dfd7c2422e4ff546e094b1a314b67b75014d6f37267b50216867c98968cf4b",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/unmerge-singleton.jsonl": "9ebf6219bc1cddace70deac8d8bea0d55c7e54800e9a20909809dccb41afcd22",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/swap-app.jsonl": "512067c785291b5ac6215be88bc701a75242e0499c74947ee3ec0fc683547d7b",
+      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/third-end-held-accept.jsonl": "c9f52d5d003d8f23ca7b96199adee56f720f46eb4a8d99413bf43aa4647d8eb6"
     }
   },
   "pushReportDeadlineSeconds": 4.4,
@@ -662,10 +807,16 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       selected = entry
       let generation = entry.generation
       after(0.05) { if entry.valid && entry.generation == generation { self.callback(entry) { $0.providerDidBegin?(provider) } } }
-      record(event: "provider.created", fields: ["provider": providerID(provider)])
+      record(event: "provider.created", fields: providerConfigurationJSON(entry))
     }
   }
   private func providerID(_ provider: CXProvider) -> String { String(describing: ObjectIdentifier(provider)) }
+  private func providerConfigurationJSON(_ entry: ProviderRegistration) -> [String: Any] {
+    let config = entry.provider.configuration
+    return ["provider": providerID(entry.provider), "apiKind": entry.apiKind.rawValue,
+      "selected": entry === selected, "valid": entry.valid,
+      "maximumCallGroups": config.maximumCallGroups, "maximumCallsPerCallGroup": config.maximumCallsPerCallGroup]
+  }
   private func callback(_ provider: ProviderRegistration, _ block: @escaping @Sendable (any CXProviderDelegate) -> Void) {
     guard let delegate = provider.delegate else { return }
     let generation = provider.generation
@@ -693,6 +844,11 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
   private func changed(_ call: CallState, notifyObservers: Bool = true) {
     let snapshot = call.snapshot()
     record(event: "call.changed", fields: callJSON(call))
+    if call.reporter.apiKind == .livecommunicationkit {
+      for waiting in calls.values where waiting !== call && waiting.ringing && waiting.reporter === call.reporter {
+        record(event: "call.changed", fields: callJSON(waiting))
+      }
+    }
     guard notifyObservers else { return }
     observers = observers.filter { $0.value.observer != nil }
     for entry in observers.values {
@@ -704,13 +860,33 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
     }
   }
   private func callJSON(_ call: CallState) -> [String: Any] {
-    ["uuid": call.id.uuidString, "outgoing": call.outgoing, "connected": call.connected,
-     "held": call.held, "ended": call.ended, "muted": call.muted, "group": call.group.uuidString,
+    var fields: [String: Any] = ["uuid": call.id.uuidString, "apiKind": call.reporter.apiKind.rawValue,
+     "outgoing": call.outgoing, "connected": call.connected,
+     "held": call.held, "ended": call.ended, "muted": call.muted,
      "ringing": call.ringing, "callerName": call.update?.localizedCallerName ?? "",
      "handle": call.update?.remoteHandle?.value ?? ""]
+    var capabilities: [String] = []
+    if call.update?.supportsHolding == true { capabilities.append("pausing") }
+    if call.update?.supportsGrouping == true { capabilities.append("merging") }
+    if call.update?.supportsUngrouping == true { capabilities.append("unmerging") }
+    fields["capabilities"] = capabilities
+    if call.reporter.apiKind == .livecommunicationkit { fields["availableSystemChoices"] = availableChoices(call) }
+    else { fields["group"] = call.group.uuidString }
+    return fields
+  }
+  private func availableChoices(_ call: CallState) -> [String] {
+    guard call.ringing, !call.ended else { return [] }
+    let established = calls.values.filter { $0.reporter === call.reporter && $0.connected && !$0.ended }
+    return LCKMultiCallPolicy.choices(established: established.count, held: established.filter(\.held).count,
+      active: established.filter { !$0.held }.count, maximumGroups: Int(call.reporter.provider.configuration.maximumCallGroups))
+  }
+  private func actionTiming(_ action: CXAction, api: ProviderAPIKind, origin: ActionOrigin) -> (deadline: Double, expiry: Double) {
+    let timing = profile.timing(api: api, answer: action is CXAnswerCallAction, start: action is CXStartCallAction,
+      pauseOrEnd: action is CXSetHeldCallAction || action is CXEndCallAction)
+    return (timing.deadline, api == .livecommunicationkit && origin == .failureCleanup ? profile.lckMultiCall.cleanupEndExpirySeconds : timing.expiry)
   }
   private func actionFields(_ item: RuntimePendingAction) -> [String: Any] {
-    let timing = profile.timing(api: item.apiKind, answer: item.action is CXAnswerCallAction, start: item.action is CXStartCallAction)
+    let timing = actionTiming(item.action, api: item.apiKind, origin: item.origin)
     let kind: String
     switch item.action {
     case is CXAnswerCallAction: kind = "answer"
@@ -722,14 +898,19 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
     case is CXSetGroupCallAction: kind = "group"
     default: kind = NSStringFromClass(type(of: item.action))
     }
-    return ["actionID": item.action.uuid.uuidString, "kind": kind,
+    var fields: [String: Any] = ["actionID": item.action.uuid.uuidString, "kind": kind,
       "callUUID": (item.action as? CXCallAction)?.callUUID.uuidString ?? "",
       "transactionID": item.transaction.uuid.uuidString, "origin": item.origin.rawValue,
       "provider": providerID(item.provider.provider), "apiKind": item.apiKind.rawValue,
       "issuedAtMS": Int64(item.issuedAt.timeIntervalSince1970 * 1000),
       "deadlineMS": Int64(item.issuedAt.addingTimeInterval(timing.deadline).timeIntervalSince1970 * 1000),
+      "expiryMS": Int64(item.issuedAt.addingTimeInterval(timing.expiry).timeIntervalSince1970 * 1000),
       "deadlineSeconds": timing.deadline, "expirySeconds": timing.expiry,
       "latencyMS": Double(DispatchTime.now().uptimeNanoseconds - item.issuedUptime) / 1_000_000]
+    if let hold = item.action as? CXSetHeldCallAction { fields["held"] = hold.isOnHold }
+    if let group = item.action as? CXSetGroupCallAction { fields["groupTargetUUID"] = group.callUUIDToGroupWith?.uuidString ?? "" }
+    if let tones = item.action as? CXPlayDTMFCallAction { fields["digits"] = tones.digits }
+    return fields
   }
   private func requestError(_ code: Int) -> NSError {
     NSError(domain: "com.apple.CallKit.error.requesttransaction", code: code)
@@ -741,6 +922,11 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       guard let action = action as? CXCallAction else { return requestError(6) }
       if action is CXStartCallAction {
         if calls[action.callUUID] != nil || !starts.insert(action.callUUID).inserted { return requestError(5) }
+        if let provider = selected, provider.apiKind == .livecommunicationkit {
+          let established = calls.values.filter { $0.reporter === provider && !$0.ended && ($0.connected || $0.outgoing || !$0.ringing) }.count
+          if !LCKMultiCallPolicy.canStart(established: established, reservedStarts: starts.count - 1,
+            maximumGroups: Int(provider.provider.configuration.maximumCallGroups)) { return requestError(7) }
+        }
       } else {
         guard calls[action.callUUID] != nil else { return requestError(4) }
         if action is CXAnswerCallAction && origin == .application && calls.values.contains(where: { $0.id != action.callUUID && !$0.ended }) {
@@ -800,8 +986,9 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       call.outgoing = true; call.ringing = false; calls[call.id] = call; changed(call)
     }
   }
-  private func deliver(_ actions: [CXAction], _ provider: ProviderRegistration, origin: ActionOrigin, requestID: UUID? = nil, generation: UInt64? = nil) {
-    guard provider.valid && (generation == nil || provider.generation == generation) else { return }
+  @discardableResult
+  private func deliver(_ actions: [CXAction], _ provider: ProviderRegistration, origin: ActionOrigin, requestID: UUID? = nil, generation: UInt64? = nil) -> UUID? {
+    guard provider.valid && (generation == nil || provider.generation == generation) else { return nil }
     // Creation with the same concrete actions intentionally yields a fresh transaction UUID.
     let delivered = CXTransaction(actions: actions)
     record(event: "transaction.delivered", fields: ["transactionID": delivered.uuid.uuidString,
@@ -812,15 +999,19 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
         if let hold = action as? CXSetHeldCallAction { return ["held": hold.isOnHold] }
         if let mute = action as? CXSetMutedCallAction { return ["muted": mute.isMuted] }
         if let tones = action as? CXPlayDTMFCallAction { return ["digits": tones.digits] }
+        if let group = action as? CXSetGroupCallAction { return ["groupTargetUUID": group.callUUIDToGroupWith?.uuidString ?? ""] }
         return [:]
       },
       "kinds": actions.map { NSStringFromClass(type(of: $0)) }])
+    if provider.apiKind == .livecommunicationkit {
+      for case let hold as CXSetHeldCallAction in actions { calls[hold.callUUID]?.holdRevision &+= 1 }
+    }
+    let composite = provider.apiKind == .livecommunicationkit ? LCKRuntimeComposite(actions, calls: calls, origin: origin) : nil
     for action in actions {
-      let timing = profile.timing(api: provider.apiKind,
-        answer: action is CXAnswerCallAction, start: action is CXStartCallAction)
+      let timing = actionTiming(action, api: provider.apiKind, origin: origin)
       let pending = RuntimePendingAction(action, provider, delivered, origin,
         call: (action as? CXCallAction).flatMap { calls[$0.callUUID] },
-        groupTarget: (action as? CXSetGroupCallAction)?.callUUIDToGroupWith.flatMap { calls[$0] })
+        groupTarget: (action as? CXSetGroupCallAction)?.callUUIDToGroupWith.flatMap { calls[$0] }, lckComposite: composite)
       let issued = pending.issuedAt
       let deadline = issued.addingTimeInterval(timing.deadline)
       deadlines.setObject(deadline as NSDate, forKey: action)
@@ -829,15 +1020,93 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
         call.ringing = false; changed(call, notifyObservers: false)
       }
       pendingActions[action.uuid] = pending
+      if composite?.systemComposite == true, let hold = action as? CXSetHeldCallAction,
+         hold.isOnHold, let call = pending.call {
+        let revision = call.holdRevision
+        after(profile.lckMultiCall.pausedAfterDeliverySeconds) {
+          guard provider.valid, provider.generation == pending.generation, self.calls[call.id] === call,
+                call.holdRevision == revision else { return }
+          call.held = true; self.changed(call); self.reconcileAudio(provider: provider, delay: 0)
+        }
+      }
       after(max(0, issued.addingTimeInterval(timing.expiry).timeIntervalSinceNow)) { [weak self, weak pending] in
         guard let self, let pending, self.pendingActions[action.uuid] === pending, !pending.expired else { return }
         self.expire(pending)
       }
     }
     callback(provider) { CKSimPerform($0, provider.provider, delivered) }
+    return delivered.uuid
+  }
+  private func settleLCK(_ item: RuntimePendingAction, fulfilled: Bool) {
+    let action = item.action
+    let kind: LCKMultiCallPolicy.Kind = action is CXAnswerCallAction ? .join : action is CXEndCallAction ? .end :
+      (action as? CXSetHeldCallAction)?.isOnHold == true ? .pause : action is CXSetHeldCallAction ? .resume : .other
+    let failure = LCKMultiCallPolicy.failure(kind)
+    pendingActions.removeValue(forKey: action.uuid)
+    if let call = item.call, calls[call.id] === call {
+      if fulfilled && item.lckComposite?.systemComposite != true {
+        switch kind {
+        case .join:
+          call.connected = true; call.held = false; call.ringing = false; changed(call)
+          reconcileAudio(provider: item.provider, delay: 0.29)
+        case .pause, .resume:
+          call.held = kind == .pause; changed(call)
+          reconcileAudio(provider: item.provider, delay: kind == .pause ? 0.09 : 0.18)
+        default: break
+        }
+      }
+      if (fulfilled && kind == .end) || (!fulfilled && failure == .endRegardless) { endCall(call.id, provider: item.provider) }
+      else if !fulfilled && failure == .endWithCleanup {
+        after(profile.lckMultiCall.joinedAfterSettlementSeconds) {
+          guard item.provider.valid, item.provider.generation == item.generation, self.calls[call.id] === call else { return }
+          self.endCall(call.id, provider: item.provider)
+          self.deliver([CXEndCallAction(call: call.id)], item.provider, origin: .failureCleanup, generation: item.generation)
+        }
+      }
+      if fulfilled, item.origin == .application, let resume = action as? CXSetHeldCallAction,
+         !resume.isOnHold, item.transaction.actions.count == 1 {
+        let config = item.provider.provider.configuration
+        if LCKMultiCallPolicy.shouldEndActiveOnResume(maximumGroups: Int(config.maximumCallGroups), maximumPerGroup: Int(config.maximumCallsPerCallGroup)),
+           let other = calls.values.first(where: { $0.reporter === call.reporter && $0.id != call.id && $0.connected && !$0.held && !$0.ended }) {
+          let revision = call.holdRevision
+          let elapsed = Double(DispatchTime.now().uptimeNanoseconds - item.issuedUptime) / 1_000_000_000
+          after(LCKMultiCallPolicy.resumeEndDelay(nominal: profile.lckMultiCall.appResumeEndDelaySeconds, elapsedSinceIssued: elapsed)) {
+            guard self.calls[call.id] === call, !call.held, call.holdRevision == revision,
+                  self.calls[other.id] === other, !other.held else { return }
+            self.deliver([CXEndCallAction(call: other.id)], item.provider, origin: .system, generation: item.generation)
+          }
+        }
+      }
+    }
+    finishLCKBarrier(item, fulfilled: fulfilled)
+  }
+  private func finishLCKBarrier(_ item: RuntimePendingAction, fulfilled: Bool) {
+    guard let composite = item.lckComposite, composite.systemComposite,
+          let joining = composite.barrier.settle(item.action.uuid, fulfilled: fulfilled) else { return }
+    let delay = composite.systemComposite ? profile.lckMultiCall.joinedAfterSettlementSeconds : 0
+    after(delay) {
+      guard item.provider.valid, item.provider.generation == item.generation else { return }
+      for id in joining {
+        guard let call = composite.joining[id], self.calls[id] === call,
+              call.holdRevision == composite.joiningRevisions[id] else { continue }
+        call.connected = true; call.held = false; call.ringing = false; self.changed(call)
+      }
+      if composite.systemComposite && self.handoffPending {
+        if self.lckHandoff.markJoined() { self.handoffPending = false }
+      }
+      self.reconcileAudio(provider: item.provider, delay: 0)
+    }
   }
   private func expire(_ item: RuntimePendingAction) {
     record(event: "action.expired", fields: actionFields(item))
+    if item.apiKind == .livecommunicationkit && (item.action is CXAnswerCallAction || item.action is CXSetHeldCallAction || item.action is CXEndCallAction) {
+      item.expired = true; item.settled = true
+      record(event: "action.timeout", fields: actionFields(item))
+      callback(item.provider) { $0.provider?(item.provider.provider, timedOutPerforming: item.action) }
+      if item.origin == .failureCleanup { pendingActions.removeValue(forKey: item.action.uuid) }
+      else { settleLCK(item, fulfilled: false) }
+      return
+    }
     if let answer = item.action as? CXAnswerCallAction {
       item.expired = true
       if let call = item.call, calls[answer.callUUID] === call {
@@ -846,6 +1115,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       return
     }
     pendingActions.removeValue(forKey: item.action.uuid)
+    if item.apiKind == .livecommunicationkit { finishLCKBarrier(item, fulfilled: false) }
     record(event: "action.timeout", fields: actionFields(item))
     callback(item.provider) { $0.provider?(item.provider.provider, timedOutPerforming: item.action) }
     if let call = item.call, calls[call.id] === call, item.action is CXEndCallAction {
@@ -869,13 +1139,23 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
         }
         return true
       }
+      if item.apiKind == .livecommunicationkit && item.origin == .failureCleanup { return true }
+      if item.apiKind == .livecommunicationkit && (action is CXAnswerCallAction || action is CXSetHeldCallAction || action is CXEndCallAction || action is CXSetGroupCallAction) {
+        // Merge/Unmerge pass through without any state transition or capability gate.
+        settleLCK(item, fulfilled: fulfilled)
+        return true
+      }
       if item.expired { pendingActions.removeValue(forKey: action.uuid); return true }
       guard let call = item.call, calls[call.id] === call else {
         // A system end can arrive after an answer failure already removed the
         // call. Fulfillment is ignored, and the action's own timer still fires.
+        if item.apiKind == .livecommunicationkit {
+          pendingActions.removeValue(forKey: action.uuid); finishLCKBarrier(item, fulfilled: false)
+        }
         return true
       }
       pendingActions.removeValue(forKey: action.uuid)
+      if item.apiKind == .livecommunicationkit { finishLCKBarrier(item, fulfilled: fulfilled) }
       if !fulfilled {
         if action is CXAnswerCallAction {
           after(0.29) {
@@ -1049,12 +1329,23 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       self.changeAudio(desired, provider: provider, revision: revision)
     }
   }
+  private func releaseHandoff(_ provider: ProviderRegistration, revision: UInt64) {
+    if provider.apiKind == .livecommunicationkit {
+      after(profile.lckMultiCall.audioHandoffGapSeconds) {
+        guard self.audioRevision == revision, self.handoffPending else { return }
+        if self.lckHandoff.markGapElapsed() {
+          self.handoffPending = false; self.reconcileAudio(provider: provider, delay: 0)
+        }
+      }
+    } else {
+      handoffPending = false; reconcileAudio(provider: provider, delay: 0.15)
+    }
+  }
   private func changeAudio(_ desired: Bool, provider: ProviderRegistration, revision: UInt64) {
     guard audioRevision == revision else { return }
     guard desired != audioActive else {
       if !desired && handoffPending {
-        handoffPending = false
-        reconcileAudio(provider: provider, delay: 0.15)
+        releaseHandoff(provider, revision: revision)
       }
       return
     }
@@ -1082,8 +1373,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
           else { $0.provider?(provider.provider, didDeactivate: AVAudioSession.sharedInstance()) }
         }
         if !desired && self.handoffPending {
-          self.handoffPending = false
-          self.reconcileAudio(provider: provider, delay: 0.15)
+          self.releaseHandoff(provider, revision: revision)
         }
       }
     }
@@ -1124,10 +1414,17 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
     }
   }
   private func execute(_ command: Command, _ object: [String: Any]) throws -> [String: Any] {
+    if command.applicationRequest == true {
+      guard selected?.apiKind == .livecommunicationkit, ["hold", "merge", "unmerge"].contains(command.operation) else {
+        throw ControlError.invalid("applicationRequest requires an LCK hold, merge or unmerge control")
+      }
+    }
+    let origin: ActionOrigin = command.applicationRequest == true ? .application : .system
     switch command.operation {
-    case "status": return ["calls": calls.values.map(callJSON), "pending": pendingActions.values.filter { !$0.settled }.count, "audioActive": audioActive, "sequence": sequence,
-      "incomingErrorCode": faults.incomingErrorCode ?? 0,
-      "incomingFilter": incomingFilter.snapshot(policy: profile.incomingFilterPolicies[incomingFilter.rawValue])]
+    case "status": return ["calls": calls.values.map(callJSON), "pending": pendingActions.values.filter { !$0.settled }.count,
+      "audioActive": audioActive, "sequence": sequence, "incomingErrorCode": faults.incomingErrorCode ?? 0,
+      "incomingFilter": incomingFilter.snapshot(policy: profile.incomingFilterPolicies[incomingFilter.rawValue]),
+      "providerConfigurations": providers.values.sorted { providerID($0.provider) < providerID($1.provider) }.map(providerConfigurationJSON)]
     case "events": return ["events": (try? String(contentsOf: controlRoot.appendingPathComponent("events.jsonl"), encoding: .utf8)) ?? ""]
     case "inspect-adapter":
       let name = "CallKitVoIPPushDelegate"
@@ -1177,7 +1474,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       callback(provider) { $0.providerDidReset(provider.provider) }
       return ["reset": true, "provider": providerID(provider.provider)]
     default:
-      guard let provider = selected, provider.valid, let uuid = command.callUUID, calls[uuid] != nil else { throw ControlError.invalid("unknown call or provider") }
+      guard let provider = selected, provider.valid, let uuid = command.callUUID, let call = calls[uuid] else { throw ControlError.invalid("unknown call or provider") }
       let actions: [CXAction]
       switch command.operation {
       case "answer": actions = [CXAnswerCallAction(call: uuid)]
@@ -1185,6 +1482,12 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       case "hold":
         guard let held = command.held else { throw ControlError.invalid("held required") }
         actions = [CXSetHeldCallAction(call: uuid, onHold: held)]
+      case "merge", "unmerge":
+        guard provider.apiKind == .livecommunicationkit else { throw ControlError.invalid("unmeasured CallKit group control") }
+        if command.operation == "merge" {
+          guard let target = command.groupWithCallUUID else { throw ControlError.invalid("groupWithCallUUID required") }
+          actions = [CXSetGroupCallAction(call: uuid, callUUIDToGroupWith: target)]
+        } else { actions = [CXSetGroupCallAction(call: uuid, callUUIDToGroupWith: nil)] }
       case "mute":
         guard let muted = command.muted else { throw ControlError.invalid("muted required") }
         actions = [CXSetMutedCallAction(call: uuid, muted: muted)]
@@ -1194,22 +1497,38 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
           throw ControlError.invalid("invalid DTMF digits")
         }
         actions = [CXPlayDTMFCallAction(call: uuid, digits: digits, type: .singleTone)]
-      case "hold-and-accept", "end-and-accept":
+      case "hold-and-accept", "end-and-accept", "end-held-and-accept":
         guard let active = command.activeCallUUID, active != uuid, calls[active]?.connected == true else { throw ControlError.invalid("activeCallUUID required") }
-        actions = [command.operation == "hold-and-accept" ? CXSetHeldCallAction(call: active, onHold: true) : CXEndCallAction(call: active), CXAnswerCallAction(call: uuid)]
+        if provider.apiKind == .livecommunicationkit,
+           calls[active]?.reporter !== call.reporter || calls[active]?.held != false { throw ControlError.invalid("activeCallUUID must identify the joined call") }
+        if provider.apiKind == .livecommunicationkit && !availableChoices(call).contains(command.operation) {
+          throw ControlError.invalid("system choice unavailable")
+        }
+        if command.operation == "end-held-and-accept" {
+          guard provider.apiKind == .livecommunicationkit, let held = command.heldCallUUID,
+                held != active, held != uuid, let heldCall = calls[held], heldCall.connected,
+                heldCall.held, heldCall.reporter === call.reporter else { throw ControlError.invalid("heldCallUUID required") }
+          // #85 third-end-held-accept briefly reports the held conversation joined first.
+          heldCall.held = false; changed(heldCall)
+          actions = [CXSetHeldCallAction(call: active, onHold: true), CXEndCallAction(call: held), CXAnswerCallAction(call: uuid)]
+        } else {
+          actions = [command.operation == "hold-and-accept" ? CXSetHeldCallAction(call: active, onHold: true) : CXEndCallAction(call: active), CXAnswerCallAction(call: uuid)]
+        }
       default: throw ControlError.invalid("unsupported operation")
       }
-      if let error = validate(actions, origin: .system) { throw error }
-      if command.operation == "hold-and-accept" || command.operation == "end-and-accept" {
+      if let error = validate(actions, origin: origin) { throw error }
+      if command.operation == "hold-and-accept" || command.operation == "end-and-accept" || command.operation == "end-held-and-accept" {
         // The old call relinquishes audio before the new call acquires it.
         handoffPending = true
+        lckHandoff = LCKMultiCallPolicy.Handoff()
         audioRevision += 1
         let revision = audioRevision
-        after(0.12) { self.changeAudio(false, provider: provider, revision: revision) }
+        let delay = provider.apiKind == .livecommunicationkit ? profile.lckMultiCall.audioDeactivationAfterDeliverySeconds : 0.12
+        after(delay) { self.changeAudio(false, provider: provider, revision: revision) }
       }
-      deliver(actions, provider, origin: .system, requestID: command.id)
-      if actions.count == 2 && faults.invalidateDuringHandoff == true { provider.provider.invalidate() }
-      return ["actionIDs": actions.map { $0.uuid.uuidString }]
+      guard let transaction = deliver(actions, provider, origin: origin, requestID: command.id) else { throw ControlError.invalid("provider unavailable") }
+      if actions.count > 1 && faults.invalidateDuringHandoff == true { provider.provider.invalidate() }
+      return ["actionIDs": actions.map { $0.uuid.uuidString }, "transactionID": transaction.uuidString]
     }
   }
 }

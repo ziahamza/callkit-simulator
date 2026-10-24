@@ -49,6 +49,10 @@ struct InspectorView: View {
           }
         }
         Section("Conversations") {
+          ForEach(model.providerConfigurations) { configuration in
+            Text("Configured maximums: \(configuration.maximumCallGroups.map(String.init) ?? "?") groups · \(configuration.maximumCallsPerCallGroup.map(String.init) ?? "?") calls per group")
+              .font(.caption).foregroundStyle(.secondary)
+          }
           if model.conversations.isEmpty {
             Text("Waiting for the app to report a call.").foregroundStyle(.secondary)
           }
@@ -58,6 +62,9 @@ struct InspectorView: View {
                 VStack(alignment: .leading, spacing: 4) {
                   Text(call.caller).foregroundStyle(.primary)
                   Text(call.uuid ?? "").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                  if let capabilities = call.capabilities {
+                    Text("Capabilities (informational): " + (capabilities.isEmpty ? "none" : capabilities.joined(separator: ", "))).font(.caption).foregroundStyle(.secondary)
+                  }
                 }
                 Spacer()
                 Text(call.status).font(.subheadline).foregroundStyle(.secondary)
@@ -65,6 +72,11 @@ struct InspectorView: View {
             }.buttonStyle(.plain)
           }
         }
+        Section {
+          Text("Pause / End: effective expiry ≈5.3 s. Join: ≈64 s. LCK still reports a timeoutDate of 30 s.")
+          Text(InspectorLCKProjection.provenance).font(.caption).foregroundStyle(.secondary)
+          Text("LCK exposes no group membership or transaction IDs. Simulator IDs are modeled and unverified on LCK. App Merge / Unmerge pass through without changing system state; lock-screen Merge delivers no app action.").font(.caption).foregroundStyle(.secondary)
+        } header: { Text("Measured LCK multi-call · #85") }
         Section("Audio") {
           Label(model.audioActive ? "Audio active" : "Audio inactive", systemImage: model.audioActive ? "waveform" : "speaker.slash")
             .accessibilityIdentifier("audio-state")
@@ -121,9 +133,12 @@ struct InspectorView: View {
               TimelineView(.periodic(from: .now, by: 0.25)) { context in
                 VStack(alignment: .leading, spacing: 4) {
                   Text(action.title).font(.headline)
-                  if let deadline = action.deadlineMS {
-                    Text(String(format: "Deadline in %.1f s", max(0, deadline / 1000 - context.date.timeIntervalSince1970)))
-                      .monospacedDigit().foregroundStyle(.orange)
+                  let timing = InspectorLCKProjection.actionTiming(for: action, nowMS: context.date.timeIntervalSince1970 * 1000)
+                  if let effective = timing.effective {
+                    ProgressView(String(format: "Effective expiry in %.1f s", effective.remainingSeconds), value: effective.progress).tint(.orange)
+                  }
+                  if let reported = timing.reported {
+                    ProgressView(String(format: "Reported timeoutDate in %.1f s", reported.remainingSeconds), value: reported.progress)
                   }
                   Text(action.detail).font(.caption).foregroundStyle(.secondary)
                 }
@@ -160,7 +175,9 @@ private struct CallButtons: View {
   var body: some View {
     VStack(spacing: 12) {
       if call.ended != true {
-        if call.ringing == true {
+        if call.apiKind == "livecommunicationkit" {
+          LCKCallButtons(model: model, call: call)
+        } else if call.ringing == true {
           if let active = model.active(excluding: call.uuid) {
             if compact {
               Button(action: { expand?() }) { Text("Call waiting options").frame(minHeight: 44) }.buttonStyle(.borderedProminent)
@@ -187,6 +204,60 @@ private struct CallButtons: View {
         .foregroundStyle(["answer", "hold-and-accept", "end-and-accept"].contains(operation) ? Color.black : .white)
         .frame(maxWidth: .infinity, minHeight: 44)
     }.buttonStyle(.borderedProminent).tint(tint).accessibilityIdentifier(operation)
+  }
+}
+private struct LCKCallButtons: View {
+  @ObservedObject var model: InspectorModel
+  let call: RuntimeEvent
+  private var active: [RuntimeEvent] { model.targets(excluding: call, held: false) }
+  private var held: [RuntimeEvent] { model.targets(excluding: call, held: true) }
+  private func title(_ choice: String) -> String {
+    ["answer": "Answer", "decline": "Decline", "hold-and-accept": "Hold & Accept",
+     "end-and-accept": "End & Accept", "end-held-and-accept": "End Held & Accept"][choice] ?? choice
+  }
+  var body: some View {
+    VStack(spacing: 12) {
+      if call.ringing == true {
+        Text("System choices").font(.caption).foregroundStyle(.secondary)
+        if let choices = InspectorLCKProjection.systemChoices(for: call) {
+          ForEach(choices, id: \.self) { choice in
+            if choice == "end-held-and-accept" {
+              Menu(title(choice)) {
+                ForEach(active) { activeCall in
+                  Menu("Active: \(activeCall.caller) · \(activeCall.uuid ?? "")") {
+                    ForEach(held) { heldCall in
+                      Button("End held: \(heldCall.caller) · \(heldCall.uuid ?? "")") {
+                        model.send(choice, call: call, active: activeCall, heldCall: heldCall)
+                      }.disabled(model.isPending(activeCall) || model.isPending(heldCall))
+                    }
+                  }
+                }
+              }.disabled(active.isEmpty || held.isEmpty).accessibilityIdentifier(choice)
+            } else if choice == "hold-and-accept" || choice == "end-and-accept" {
+              Menu(title(choice)) {
+                ForEach(active) { target in
+                  Button("Active: \(target.caller) · \(target.uuid ?? "")") { model.send(choice, call: call, active: target) }
+                    .disabled(model.isPending(target))
+                }
+              }.disabled(active.isEmpty).accessibilityIdentifier(choice)
+            } else {
+              Button(title(choice)) { model.send(choice, call: call) }.accessibilityIdentifier(choice)
+            }
+          }
+        } else { Text("System choices unavailable").font(.caption).foregroundStyle(.secondary) }
+      }
+      Text("App requests · capabilities do not gate these requests").font(.caption).foregroundStyle(.secondary)
+      Button(call.held == true ? "App Resume" : "App Pause") { model.send("hold", call: call, held: call.held != true, applicationRequest: true) }
+        .accessibilityIdentifier(call.held == true ? "resume" : "pause")
+      Menu("App Merge with…") {
+        ForEach(InspectorLCKProjection.appMergeTargets(for: call, calls: Array(model.conversations.values))) { target in
+          Button("\(target.caller) · \(target.uuid ?? "")") { model.send("merge", call: call, groupTarget: target, applicationRequest: true) }
+            .disabled(model.isPending(target))
+        }
+      }.disabled(model.targets(excluding: call).isEmpty).accessibilityIdentifier("app-merge")
+      Button("App Unmerge") { model.send("unmerge", call: call, applicationRequest: true) }.accessibilityIdentifier("app-unmerge")
+      Button("End Call", role: .destructive) { model.send("end", call: call) }.accessibilityIdentifier("end")
+    }.buttonStyle(.bordered).controlSize(.large)
   }
 }
 private struct CallScreen: View {

@@ -233,7 +233,12 @@ def control(args, device, expected_session=None):
     identifier = str(uuid.uuid4()).upper()
     command = {key: session[key] for key in ("runID", "pid", "bundleID")}
     command.update(id=identifier, operation=args.operation)
-    for argument, field in (("call", "callUUID"), ("active_call", "activeCallUUID")):
+    if getattr(args, "application", False):
+        if args.operation not in ("hold", "merge", "unmerge"):
+            raise RuntimeError("Application requests require hold, merge or unmerge.")
+        command["applicationRequest"] = True
+    for argument, field in (("call", "callUUID"), ("active_call", "activeCallUUID"),
+                            ("held_call", "heldCallUUID"), ("group_with_call", "groupWithCallUUID")):
         if getattr(args, argument, None):
             command[field] = str(uuid.UUID(getattr(args, argument))).upper()
     if args.operation == "push":
@@ -414,17 +419,33 @@ class InspectorBridge:
                 raise RuntimeError("Invalid incoming filter control.")
             arguments = dict(vars(self.args), operation="incoming-filter", reason=value["reason"], command_receipt=None)
             return control(SimpleNamespace(**arguments), self.device, expected_session=self.journal.session)
-        if (not isinstance(value, dict) or set(value) - {"operation", "callUUID", "activeCallUUID"} or
-                value.get("operation") not in ("answer", "decline", "end", "hold-and-accept", "end-and-accept")):
+        extra = {"hold": {"held"}, "merge": {"groupWithCallUUID"}, "unmerge": set(),
+                 "end-held-and-accept": {"activeCallUUID", "heldCallUUID"}}
+        legacy = ("answer", "decline", "end", "hold-and-accept", "end-and-accept")
+        if not isinstance(value, dict) or value.get("operation") not in (*legacy, *extra):
             raise RuntimeError("Unsupported inspector control.")
-        if not isinstance(value.get("callUUID"), str) or value.get("activeCallUUID") is not None and not isinstance(value["activeCallUUID"], str):
-            raise RuntimeError("Inspector call identifiers must be UUID strings.")
-        call = str(uuid.UUID(value.get("callUUID", "")))
-        active = value.get("activeCallUUID")
-        if active is not None:
-            active = str(uuid.UUID(active))
-        arguments = dict(vars(self.args), operation=value["operation"], call=call,
-                         active_call=active, command_receipt=None)
+        operation = value["operation"]
+        required = {"operation", "callUUID"} | extra.get(operation, set())
+        allowed = required if operation in extra else required | {"activeCallUUID"}
+        if "applicationRequest" in value:
+            if operation not in ("hold", "merge", "unmerge") or value["applicationRequest"] != "true":
+                raise RuntimeError("Invalid application request control.")
+            allowed |= {"applicationRequest"}
+        if not required <= set(value) or set(value) - allowed:
+            raise RuntimeError("Missing or unsupported inspector control parameters.")
+        arguments = dict(vars(self.args), operation=operation, command_receipt=None,
+                         application=value.get("applicationRequest") == "true")
+        for field, argument in (("callUUID", "call"), ("activeCallUUID", "active_call"),
+                                ("heldCallUUID", "held_call"), ("groupWithCallUUID", "group_with_call")):
+            if field in value and not isinstance(value[field], str):
+                raise RuntimeError("Inspector call identifiers must be UUID strings.")
+            arguments[argument] = str(uuid.UUID(value[field])) if field in value else None
+        if operation == "hold":
+            if value["held"] not in ("true", "false"):
+                raise RuntimeError("Inspector held must be true or false.")
+            arguments["held"] = value["held"]
+        if operation == "end-held-and-accept" and len({arguments[key] for key in ("call", "active_call", "held_call")}) != 3:
+            raise RuntimeError("Waiting, active and held calls must be distinct.")
         return control(SimpleNamespace(**arguments), self.device, expected_session=self.journal.session)
 
 
@@ -610,21 +631,30 @@ def main():
                            help="Allow a supplied shared display for a bounded, background-capable test fixture")
     for operation in ("status", "events", "inspect-adapter", "install", "uninstall", "repair", "launch", "reset"):
         commands.add_parser(operation)
-    for operation in ("answer", "decline", "end"):
-        commands.add_parser(operation).add_argument("call")
+    for operation in ("answer", "decline", "end", "unmerge"):
+        cmd = commands.add_parser(operation)
+        cmd.add_argument("call")
+        if operation == "unmerge": cmd.add_argument("--application", action="store_true")
+    merge = commands.add_parser("merge")
+    merge.add_argument("call")
+    merge.add_argument("--group-with-call", required=True)
+    merge.add_argument("--application", action="store_true")
     hold = commands.add_parser("hold")
     hold.add_argument("call")
     hold.add_argument("--held", choices=("true", "false"), required=True)
+    hold.add_argument("--application", action="store_true")
     mute = commands.add_parser("mute")
     mute.add_argument("call")
     mute.add_argument("--muted", choices=("true", "false"), required=True)
     tones = commands.add_parser("tones")
     tones.add_argument("call")
     tones.add_argument("--digits", required=True)
-    for operation in ("hold-and-accept", "end-and-accept"):
+    for operation in ("hold-and-accept", "end-and-accept", "end-held-and-accept"):
         cmd = commands.add_parser(operation)
         cmd.add_argument("call")
         cmd.add_argument("--active-call", required=True)
+        if operation == "end-held-and-accept":
+            cmd.add_argument("--held-call", required=True)
     push = commands.add_parser("push")
     push.add_argument("--payload-file", type=Path, required=True)
     push.add_argument("--must-report", choices=("true", "false"), required=True)

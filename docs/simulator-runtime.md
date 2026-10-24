@@ -186,6 +186,22 @@ still takes priority. Each entered report retains its fault/filter snapshot.
 The native acceptance checks actual completion NSError callbacks for filters
 3/5–7 and injected fault 4, live mailbox survival beyond 4.4 s, and a 69-second repeat.
 
+The [iOS 27.0 LCK multi-call measurements](research/callkit-simulator-probe/livecommunicationkit/multicall/README.md)
+([#85](https://github.com/ziahamza/ios-voip-sdk/pull/85)) drive the multi-call profile.
+Hold/End/End Held & Accept form one modeled transaction; Join waits for every
+constituent to settle. Failing Pause ends its call; failing Join ends the accepted
+call without resuming the held call. End failure is ignored; failed Join during
+End & Accept loses both calls. LCK exposes no transaction IDs or group memberships, so
+journal IDs are simulator correlation IDs. Configuration controls the offered
+choices and Start capacity error `com.apple.CallKit.error.requesttransaction` 7;
+capabilities do not gate the measured choices.
+Merge/Unmerge pass through without state changes. Use `hold CALL --held false --application`
+for app Resume, or `--application` with hold/merge/unmerge; with 2×1, Resume ends
+the other active call. Unmarked controls remain system-origin. The Inspector
+provides these app requests separately from its authoritative system choices.
+Unmeasured behavior and the remaining [device needs](progress/2026-10-24-m5-device-needs.md)
+stay explicit in the profile and progress note.
+
 For direct launch customization, the process environment accepts `CKSIM_RUN_ID`,
 `CKSIM_PROFILE=ios-27.0` and `CKSIM_LATENCY=device`. `CKSIM_SHADOW=1` additionally
 forwards incoming reports to genuine CallKit, shielding the app from its simulator
@@ -255,9 +271,9 @@ violations, audio activation/deactivation/failure and runtime diagnostics are on
 this channel too. Caller metadata is local development data in the app container.
 
 Compare action latency to its advertised budget: the measured profile has LCK
-30 s deadlines and CallKit 60/600/5 s deadlines. This is a deadline comparison,
-not a measured device benchmark for the application's handler. Profile expiry
-policies retain the measured/proposed qualifications in the profile source.
+30 s advertised deadlines, with measured effective Pause/End expiry about 5.3 s
+and Join expiry about 64 s; CallKit advertises 60/600/5 s. A handler's simulator
+latency is not a device benchmark. Other LCK expiry policies remain unverified.
 
 ### SwiftUI call inspector (M4 MVP)
 
@@ -280,8 +296,8 @@ never deleted by the command. The inspector is iPhone-only for this MVP.
 The incoming banner expands to a full call screen. Answer and Decline handle a
 single incoming call; Call waiting options offers Hold & Accept and End & Accept
 when another call is active. End Call ends a connected call. Buttons dispatch the
-runtime's existing system-origin commands; acceptance is shown only after the
-journal records the resulting state. Conversations, pending deadlines, action
+runtime's system-origin commands; the LCK App Pause/Resume/Merge/Unmerge controls
+explicitly request application origin. Acceptance follows the journal state. Conversations, pending deadlines, action
 settlement latency versus the profile budget, and audio activation remain live.
 The device-reference section compares journal-measured simulator intervals with
 the iPhone 13 / iOS 27.0 LCK captures: about 190 ms from push to report done,

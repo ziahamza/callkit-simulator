@@ -45,6 +45,11 @@ struct RuntimeEvent: Codable, Identifiable {
   var transactionID: String?
   var pushID: String?
   var provider: String?
+  var capabilities: [String]?
+  var availableSystemChoices: [String]?
+  var maximumCallGroups: Int?
+  var maximumCallsPerCallGroup: Int?
+  var groupTargetUUID: String?
   var requestID: String?
   var reason: RuntimeEventError?
   var code: Int?
@@ -61,6 +66,8 @@ struct RuntimeEvent: Codable, Identifiable {
   var apiKind: String?
   var deadlineMS: Double?
   var deadlineSeconds: Double?
+  var expiryMS: Double?
+  var expirySeconds: Double?
   var latencyMS: Double?
   var fulfilled: Bool?
   var mustReport: Bool?
@@ -79,6 +86,12 @@ struct RuntimeEvent: Codable, Identifiable {
   var id: Int { sequence }
   var caller: String { [callerName, handle].compactMap { $0 }.first { !$0.isEmpty } ?? "Unknown caller" }
   var status: String {
+    if apiKind == "livecommunicationkit" {
+      if ended == true { return "left" }
+      if held == true { return "paused" }
+      if connected == true { return "joined" }
+      return "idle"
+    }
     if ended == true { return "Ended" }
     if held == true { return "On hold" }
     if connected == true { return "Connected" }
@@ -98,7 +111,9 @@ struct RuntimeEvent: Codable, Identifiable {
   var detail: String {
     var parts = [origin, apiKind].compactMap { $0 }
     if let latencyMS, event != "action.deadline" { parts.append(String(format: "%.1f ms", latencyMS)) }
-    if let deadlineSeconds { parts.append(String(format: "%.0f s profile budget", deadlineSeconds)) }
+    if let deadlineSeconds { parts.append(String(format: "%.0f s %@", deadlineSeconds, apiKind == "livecommunicationkit" ? "reported timeoutDate" : "profile budget")) }
+    if let expirySeconds { parts.append(String(format: "%.1f s effective expiry", expirySeconds)) }
+    if let transactionID { parts.append("Simulator transaction \(transactionID) · modeled; unverified on LCK") }
     if let domain, !domain.isEmpty, let code { parts.append("\(domain) \(code)") }
     if verification == "unverified" { parts.append("Unverified on device") }
     if event == "faults.configured", incomingErrorCode == 4 { parts.append("Not produced by iOS 27.0 for LCK") }
