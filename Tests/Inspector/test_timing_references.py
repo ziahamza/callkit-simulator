@@ -15,7 +15,6 @@ class TimingReferenceTests(unittest.TestCase):
             compiled = subprocess.run([
                 'swiftc', '-swift-version', '6', '-parse-as-library',
                 str(ROOT / 'Inspector/RuntimeEvent.swift'),
-                str(ROOT / 'Inspector/IncomingFilter.swift'),
                 str(ROOT / 'Inspector/RuntimeTimingReferences.swift'),
                 str(ROOT / 'Tests/Inspector/TimingReferenceTests.swift'), '-o', str(binary),
             ], text=True, capture_output=True, timeout=60)

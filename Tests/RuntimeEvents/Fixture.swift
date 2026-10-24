@@ -4,17 +4,6 @@ import SwiftUI
 import AVFAudio
 @preconcurrency import PushKit
 
-private final class ReportReceipt: @unchecked Sendable {
-  private let lock = NSLock()
-  private var replies = 0
-  func nextReply() -> Int {
-    lock.lock()
-    defer { lock.unlock() }
-    replies += 1
-    return replies
-  }
-}
-
 @MainActor
 final class Fixture: NSObject, UIApplicationDelegate, @preconcurrency CXProviderDelegate, @preconcurrency PKPushRegistryDelegate {
   var provider: CXProvider!
@@ -34,20 +23,13 @@ final class Fixture: NSObject, UIApplicationDelegate, @preconcurrency CXProvider
     background = app.beginBackgroundTask(withName: "Inspector acceptance") {}
     return true
   }
-  func ring(uuid: UUID = UUID()) {
-    let enteredAt = DispatchTime.now().uptimeNanoseconds
-    let receipt = ReportReceipt()
-    let handle = "+12025550123"
+  func ring() {
     let update = CXCallUpdate()
     update.localizedCallerName = "Alex Morgan"
-    update.remoteHandle = CXHandle(type: .phoneNumber, value: handle)
+    update.remoteHandle = CXHandle(type: .generic, value: "alex@example.test")
     update.supportsHolding = true
-    provider.reportNewIncomingCall(with: uuid, update: update) { error in
-      let observed = error as NSError?
-      CKSimEmit("fixture.reportCompleted", ["callUUID": uuid.uuidString, "handle": handle,
-        "domain": observed?.domain ?? "", "code": observed?.code ?? 0,
-        "replyCount": receipt.nextReply(), "main": Thread.isMainThread,
-        "latencyMS": Double(DispatchTime.now().uptimeNanoseconds - enteredAt) / 1_000_000])
+    provider.reportNewIncomingCall(with: UUID(), update: update) { error in
+      if let error { NSLog("Fixture report failed: %@", String(describing: error)) }
     }
   }
   func outgoing() {
@@ -56,7 +38,7 @@ final class Fixture: NSObject, UIApplicationDelegate, @preconcurrency CXProvider
   func providerDidReset(_ provider: CXProvider) {}
   func pushRegistry(_ registry: PKPushRegistry, didUpdate pushCredentials: PKPushCredentials, for type: PKPushType) {}
   func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload, for type: PKPushType, completion: @escaping () -> Void) {
-    ring(uuid: (payload.dictionaryPayload["callUUID"] as? String).flatMap(UUID.init(uuidString:)) ?? UUID())
+    ring()
     if payload.dictionaryPayload["operation"] as? String == "outgoing" { outgoing() }
     completion()
   }

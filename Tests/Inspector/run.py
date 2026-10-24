@@ -162,10 +162,6 @@ def verify_probe_journal(receipts, rows, session):
             assert all(projected[call['uuid']].get(key) == value for key, value in call.items())
         if 'timingReferences' in receipt:
             verify_timing_reference_journal(receipt, rows)
-        if 'incomingFilter' in receipt:
-            configured = [row for row in rows if row['sequence'] <= receipt['cursor']
-                          and row['event'] == 'incomingFilter.configured']
-            assert receipt['incomingFilter'] == (configured[-1]['reason'] if configured else 'none')
 
 
 def journal_mute_value(action, rows):
@@ -303,7 +299,7 @@ def verify_timing_reference_journal(receipt, rows, required=()):
             assert outstanding == 0, 'Older outstanding app fulfillments make mute echo ambiguous'
 
 
-def journal_journey(common, target, nonce, session, out, deadline, channel=None, verify_filters=False):
+def journal_journey(common, target, nonce, session, out, deadline, channel=None):
     """Drive controls and require the foreground Inspector's consumed projections."""
     container = Path(run('xcrun', 'simctl', 'get_app_container', target, INSPECTOR, 'data',
                          timeout=min(10, remaining_budget(deadline))))
@@ -362,26 +358,10 @@ def journal_journey(common, target, nonce, session, out, deadline, channel=None,
     connected = probe.wait(answered, deadline=deadline, resume_after=resumed)
     assert connected['cursor'] > incoming['cursor']
     (out / 'inspector-answered.json').write_text(json.dumps(connected))
-    filter_receipts = []
-    if verify_filters:
-        for reason, code, verification in (('do-not-disturb', 3, 'verified'), ('none', 0, 'not-applicable')):
-            foreground(session['bundleID'], session['pid'])
-            response = json.loads(command('incoming-filter', '--reason', reason))
-            assert response['success'] and response['result']['incomingFilter'] == dict(
-                reason=reason, code=code, verification=verification)
-            request_id = response['id']
-            wait_runtime(lambda rows: any(row['event'] == 'incomingFilter.configured' and
-                         row.get('requestID') == request_id for row in rows), channel, session, deadline)
-            resumed = foreground(INSPECTOR, probe.pid)
-            receipt = probe.wait(lambda row: row.get('incomingFilter') == reason and any(
-                event['event'] == 'incomingFilter.configured' and event.get('requestID') == request_id
-                for event in row['timeline']), deadline=deadline, resume_after=resumed)
-            (out / ('inspector-filter-' + reason + '.json')).write_text(json.dumps(receipt))
-            filter_receipts.append(receipt)
     captured = run(*common, 'watch', '--json', '--duration', '0.3', timeout=min(5, remaining_budget(deadline)))
     (out / 'events.jsonl').write_text(captured + '\n')
     rows = [json.loads(line) for line in captured.splitlines()]
-    verify_probe_journal((incoming, connected, *filter_receipts), rows, session)
+    verify_probe_journal((incoming, connected), rows, session)
     verify_timing_reference_journal(connected, rows, required=('pushReport', 'answerAudio'))
     answers = [row for row in rows if row.get('actionID') in action_ids and row['event'] == 'action.settled']
     assert len(answers) == 1 and answers[0]['kind'] == 'answer' and answers[0]['origin'] == 'system' and answers[0]['fulfilled']
@@ -434,10 +414,7 @@ def main():
     parser.add_argument('--display-simulator')
     parser.add_argument('--runtime', help='Require this exact available simulator runtime identifier')
     parser.add_argument('--driver', choices=('xctest', 'journal'), default='xctest')
-    parser.add_argument('--verify-filter-controls', action='store_true', help='Verify journal-driver filter selection and clearing')
     args = parser.parse_args()
-    if args.verify_filter_controls and args.driver != 'journal':
-        parser.error('--verify-filter-controls requires --driver journal')
     if args.fixture_installed and not args.target_simulator:
         parser.error('--fixture-installed requires an explicit --target-simulator')
     if args.driver == 'journal' and args.display_simulator and args.display_simulator != args.target_simulator:
@@ -487,8 +464,7 @@ def main():
                                       env=dict(os.environ, SIMCTL_CHILD_CKSIM_INSPECTOR_PROBE_NONCE=nonce) if journal else None)
         consumer_deadline = wait_for_inspector(bridge, out/'bridge.log', consumer_budget=25 if journal else None)
         if journal:
-            print(json.dumps(journal_journey(common, target, nonce, session, out, consumer_deadline, channel,
-                                             verify_filters=args.verify_filter_controls)))
+            print(json.dumps(journal_journey(common, target, nonce, session, out, consumer_deadline, channel)))
             return
         with (out / 'ui-test.log').open('w') as log:
             tests = subprocess.Popen(['xcodebuild','test-without-building','-project',str(project),'-scheme','InspectorUITests',

@@ -7,14 +7,10 @@ struct RuntimeActionParameters: Codable {
   var groupTargetUUID: String?
 }
 
-// Journal errors and reasons can be numeric codes or text.
+// Report completions use numeric error codes; control receipts use error text.
 enum RuntimeEventError: Codable {
   case code(Int)
   case message(String)
-  var messageValue: String? {
-    if case .message(let value) = self { return value }
-    return nil
-  }
 
   init(from decoder: Decoder) throws {
     let value = try decoder.singleValueContainer()
@@ -45,13 +41,6 @@ struct RuntimeEvent: Codable, Identifiable {
   var transactionID: String?
   var pushID: String?
   var provider: String?
-  var requestID: String?
-  var reason: RuntimeEventError?
-  var code: Int?
-  var domain: String?
-  var filterReason: String?
-  var verification: String?
-  var incomingErrorCode: Int?
   var actionIDs: [String]?
   var callUUIDs: [String]?
   var kinds: [String]?
@@ -85,11 +74,6 @@ struct RuntimeEvent: Codable, Identifiable {
     return ringing == true ? "Incoming call" : "Connecting"
   }
   var title: String {
-    if let state = InspectorIncomingFilterState(event: self) { return "Incoming filter · \(state.reason.title)" }
-    if event == "faults.configured", let incomingErrorCode, [0, 4].contains(incomingErrorCode) {
-      return incomingErrorCode == 4 ? "Injected incoming error 4" : "Incoming error injection cleared"
-    }
-    if event == "report.completed", let code, code != 0 { return "Incoming report rejected · code \(code)" }
     if event == "call.changed" { return "\(caller) · \(status)" }
     if event == "action.settled" { return "\(kind?.capitalized ?? "Action") \(fulfilled == true ? "fulfilled" : "failed")" }
     if event == "action.deadline" { return "\(kind?.capitalized ?? "Action") delivered" }
@@ -99,9 +83,6 @@ struct RuntimeEvent: Codable, Identifiable {
     var parts = [origin, apiKind].compactMap { $0 }
     if let latencyMS, event != "action.deadline" { parts.append(String(format: "%.1f ms", latencyMS)) }
     if let deadlineSeconds { parts.append(String(format: "%.0f s profile budget", deadlineSeconds)) }
-    if let domain, !domain.isEmpty, let code { parts.append("\(domain) \(code)") }
-    if verification == "unverified" { parts.append("Unverified on device") }
-    if event == "faults.configured", incomingErrorCode == 4 { parts.append("Not produced by iOS 27.0 for LCK") }
     return parts.joined(separator: " · ")
   }
 }

@@ -15,8 +15,6 @@ import uuid
 
 
 SIMCTL_TIMEOUT = 60
-INCOMING_FILTER_REASONS = ("none", "do-not-disturb", "restricted-sharing-mode",
-                           "call-is-protected", "sensitive-participants")
 INSTALL_KEYS = ("DYLD_INSERT_LIBRARIES", "CKSIM_RUNTIME", "CKSIM_BUNDLE_IDS", "CKSIM_ENABLED", "CKSIM_PROFILE")
 
 
@@ -245,13 +243,7 @@ def control(args, device, expected_session=None):
     if args.operation == "tones":
         command["digits"] = args.digits
     if args.operation == "faults":
-        command["faults"] = {field: value for argument, field in (("stale_audio", "staleAudio"),
-            ("report_delay_ms", "reportCallbackDelayMS"), ("invalidate_during_handoff", "invalidateDuringHandoff"),
-            ("incoming_error_code", "incomingErrorCode")) if (value := getattr(args, argument, None)) is not None}
-        if not command["faults"]:
-            command["faults"] = dict(staleAudio=False, reportCallbackDelayMS=0, invalidateDuringHandoff=False, incomingErrorCode=0)
-    if args.operation == "incoming-filter":
-        command["reason"] = args.reason
+        command["faults"] = dict(staleAudio=args.stale_audio, reportCallbackDelayMS=args.report_delay_ms, invalidateDuringHandoff=args.invalidate_during_handoff)
     mailbox = root / session["runID"]
     temporary = mailbox / f"requests/{identifier}.tmp"
     with temporary.open("x") as output:
@@ -403,17 +395,6 @@ class InspectorBridge:
 
     def command(self, value):
         from types import SimpleNamespace
-        if isinstance(value, dict) and value.get("operation") == "faults":
-            if set(value) != {"operation", "incomingErrorCode"} or value.get("incomingErrorCode") not in ("0", "4"):
-                raise RuntimeError("Invalid incoming error fault.")
-            arguments = dict(vars(self.args), operation="faults", incoming_error_code=int(value["incomingErrorCode"]),
-                             stale_audio=None, report_delay_ms=None, invalidate_during_handoff=None, command_receipt=None)
-            return control(SimpleNamespace(**arguments), self.device, expected_session=self.journal.session)
-        if isinstance(value, dict) and value.get("operation") == "incoming-filter":
-            if set(value) != {"operation", "reason"} or value.get("reason") not in INCOMING_FILTER_REASONS:
-                raise RuntimeError("Invalid incoming filter control.")
-            arguments = dict(vars(self.args), operation="incoming-filter", reason=value["reason"], command_receipt=None)
-            return control(SimpleNamespace(**arguments), self.device, expected_session=self.journal.session)
         if (not isinstance(value, dict) or set(value) - {"operation", "callUUID", "activeCallUUID"} or
                 value.get("operation") not in ("answer", "decline", "end", "hold-and-accept", "end-and-accept")):
             raise RuntimeError("Unsupported inspector control.")
@@ -632,14 +613,9 @@ def main():
     push.add_argument("--run-id")
     push.add_argument("--launch-receipt", type=Path)
     faults = commands.add_parser("faults")
-    faults.add_argument("--stale-audio", action="store_true", default=None)
-    faults.add_argument("--report-delay-ms", type=int)
-    faults.add_argument("--invalidate-during-handoff", action="store_true", default=None)
-    faults.add_argument("--incoming-error-code", type=int, choices=(0, 4),
-                        help="Inject code 4 (not produced by iOS 27.0 for LCK), or clear it with 0")
-    incoming_filter = commands.add_parser("incoming-filter", help="Set the simulator's incoming-report filter")
-    incoming_filter.add_argument("--reason", choices=INCOMING_FILTER_REASONS, required=True,
-                                 help="Persistent filter for subsequent reports; codes 5–7 are unverified")
+    faults.add_argument("--stale-audio", action="store_true")
+    faults.add_argument("--report-delay-ms", type=int, default=0)
+    faults.add_argument("--invalidate-during-handoff", action="store_true")
     args = parser.parse_args()
     if args.operation == "inspect" and args.allow_shared_simulator and not args.inspector_simulator:
         parser.error("--allow-shared-simulator requires an explicit --inspector-simulator")

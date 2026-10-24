@@ -70,28 +70,6 @@ struct InspectorView: View {
             .accessibilityIdentifier("audio-state")
         }
         Section {
-          ForEach(InspectorIncomingFilter.allCases.filter { $0 != .none }) { reason in
-            Toggle(isOn: Binding(get: { model.incomingFilter == reason }, set: {
-              model.configureIncomingFilter($0 ? reason : .none)
-            })) {
-              VStack(alignment: .leading, spacing: 3) {
-                Text(reason.title)
-                Text("Code \(reason.code) · \(reason == .doNotDisturb ? "Measured on device" : "Unverified on device")")
-                  .font(.caption).foregroundStyle(.secondary)
-              }
-            }.accessibilityIdentifier("incoming-filter-" + reason.rawValue)
-          }
-        } header: { Text("Incoming report filter") } footer: {
-          Text("One filter applies to subsequent reports. Do Not Disturb returns an error after about 2.07 s; repeated calls stay filtered. Codes 5–7 and their timings are unverified.")
-        }.disabled(model.busy || !model.online)
-        Section {
-          Toggle("Inject incoming error 4", isOn: Binding(get: { model.incomingErrorCode == 4 }, set: {
-            model.configureIncomingError($0 ? 4 : 0)
-          })).accessibilityIdentifier("inject-incoming-error-4")
-        } header: { Text("Fault injection") } footer: {
-          Text("Not produced by iOS 27.0 for LCK")
-        }.disabled(model.busy || !model.online)
-        Section {
           ForEach(model.timingReferences) { readout in
             VStack(alignment: .leading, spacing: 8) {
               Text(readout.title).font(.headline)

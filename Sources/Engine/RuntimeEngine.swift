@@ -16,57 +16,6 @@ private struct FulfilledPostEndUnmutePolicy: Decodable {
     switch api { case .callkit: callkit; case .livecommunicationkit: livecommunicationkit }
   }
 }
-private enum IncomingFilterReason: String, CaseIterable, Sendable {
-  case none
-  case doNotDisturb = "do-not-disturb"
-  case restrictedSharingMode = "restricted-sharing-mode"
-  case callIsProtected = "call-is-protected"
-  case sensitiveParticipants = "sensitive-participants"
-  var code: Int {
-    switch self {
-    case .none: 0
-    case .doNotDisturb: 3
-    case .restrictedSharingMode: 5
-    case .callIsProtected: 6
-    case .sensitiveParticipants: 7
-    }
-  }
-  func snapshot(policy: IncomingFilterPolicy?) -> [String: Any] {
-    ["reason": rawValue, "code": code, "verification": policy?.verification ?? "not-applicable"]
-  }
-}
-private struct IncomingFilterPolicy: Decodable, Sendable {
-  let code: Int
-  let delaySeconds: Double
-  let verification: String
-  let evidence: [String]
-}
-// Immutable per-report decision: later filter/fault commands cannot change an
-// entered report. Duplicate UUID errors retain their existing code-2 priority.
-private struct IncomingReportOutcome: Sendable {
-  let code: Int
-  let domain: String
-  let filterReason: String
-  let verification: String
-  let delaySeconds: Double
-  var error: NSError? { code == 0 ? nil : NSError(domain: domain, code: code) }
-  init(reason: IncomingFilterReason, duplicate: Bool, policy: IncomingFilterPolicy?, normalDelaySeconds: Double, extraDelaySeconds: Double, incomingErrorCode: Int = 0) {
-    if duplicate {
-      code = 2; filterReason = "none"; verification = "not-applicable"
-      delaySeconds = normalDelaySeconds + extraDelaySeconds
-    } else if incomingErrorCode == 4 {
-      code = 4; filterReason = "none"; verification = "injected-fault"
-      delaySeconds = normalDelaySeconds + extraDelaySeconds
-    } else if reason != .none, let policy {
-      code = reason.code; filterReason = reason.rawValue; verification = policy.verification
-      delaySeconds = policy.delaySeconds + extraDelaySeconds
-    } else {
-      code = 0; filterReason = "none"; verification = "not-applicable"
-      delaySeconds = normalDelaySeconds + extraDelaySeconds
-    }
-    domain = code == 0 ? "" : "com.apple.CallKit.error.incomingcall"
-  }
-}
 private struct BehaviorProfile: Decodable {
   let id: String
   let schemaVersion: Int
@@ -80,7 +29,6 @@ private struct BehaviorProfile: Decodable {
   let lckActionDeadlineSeconds: Double
   let reportLatencySeconds: Double
   let pushReportDeadlineSeconds: Double
-  let incomingFilterPolicies: [String: IncomingFilterPolicy]
   let muteEchoSeconds: Double
   let postEndUnmuteSeconds: Double
   let fulfilledPostEndUnmutePolicy: FulfilledPostEndUnmutePolicy
@@ -156,16 +104,9 @@ private final class ObserverRegistration: @unchecked Sendable {
 }
 
 private struct Faults: Codable {
-  var staleAudio: Bool?
-  var reportCallbackDelayMS: Int?
+  var staleAudio = false
+  var reportCallbackDelayMS = 0
   var invalidateDuringHandoff: Bool?
-  var incomingErrorCode: Int?
-  mutating func apply(_ update: Faults) {
-    if let value = update.staleAudio { staleAudio = value }
-    if let value = update.reportCallbackDelayMS { reportCallbackDelayMS = value }
-    if let value = update.invalidateDuringHandoff { invalidateDuringHandoff = value }
-    if let code = update.incomingErrorCode { incomingErrorCode = code }
-  }
 }
 // Objective-C clients supply blocks without Swift Sendable annotations. The
 // immutable block is transferred once and invoked only on its designated queue.
@@ -186,7 +127,6 @@ private struct Command: Decodable {
   var digits: String?
   var mustReport: Bool?
   var faults: Faults?
-  var reason: String?
 }
 
 // RuntimeEngine's serial state queue owns this value. An ambiguous same-UUID
@@ -314,7 +254,6 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
   private var audioRevision: UInt64 = 0
   private var handoffPending = false
   private var faults = Faults()
-  private var incomingFilter: IncomingFilterReason = .none
   private let runID: String
   private let bundleID: String
   private let controlRoot: URL
@@ -339,14 +278,6 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
     guard profile.schemaVersion == 1 && profile.id == profileID && durations.allSatisfy({ $0.isFinite && $0 > 0 }) else {
       throw BootstrapError.invalid("invalid behavior profile")
     }
-    let filteredReasons = IncomingFilterReason.allCases.filter { $0 != .none }
-    let filterPolicies = profile.incomingFilterPolicies
-    guard Set(filterPolicies.keys) == Set(filteredReasons.map(\.rawValue)),
-      filteredReasons.allSatisfy({ reason in
-        guard let policy = filterPolicies[reason.rawValue] else { return false }
-        return policy.code == reason.code && policy.delaySeconds.isFinite && policy.delaySeconds > 0 &&
-          policy.verification == (reason == .doNotDisturb ? "verified" : "unverified") && !policy.evidence.isEmpty
-      }) else { throw BootstrapError.invalid("invalid incoming filter profile") }
     let requestedRun = env["CKSIM_RUN_ID"].flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString
     guard requestedRun.range(of: "^[A-Za-z0-9_-]{1,64}$", options: .regularExpression) != nil else {
       throw BootstrapError.invalid("invalid simulator run identifier")
@@ -466,58 +397,6 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       "docs/research/callkit-simulator-probe/livecommunicationkit/push/2026-10-23-iphone13-ios27-late-report-3s.jsonl": "1ed65280b43ebe27ab8b52535bb7b1df15b301e4eb9ab6d690cc9c8690ef36cf",
       "docs/research/callkit-simulator-probe/livecommunicationkit/push/2026-10-23-iphone13-ios27-late-report-5s.jsonl": "65aa587060ac3a2e5a898d97675e0c902dba70d7c8bf0b2d7dad0ab8ad29da2c"
     }
-  },
-  "incomingFilterPolicies": {
-    "do-not-disturb": {
-      "code": 3,
-      "delaySeconds": 2.07,
-      "verification": "verified",
-      "evidence": [
-        "docs/research/callkit-simulator-probe/livecommunicationkit/push/2026-10-23-iphone13-ios27-d3-cold-unlocked-entered.jsonl",
-        "docs/research/callkit-simulator-probe/livecommunicationkit/push/2026-10-23-iphone13-ios27-d3-cold-unlocked-entered-repeat.jsonl",
-        "docs/research/callkit-simulator-probe/livecommunicationkit/push/README.md"
-      ],
-      "scope": "D3 report errors measured at 2.081 s and 2.070 s. Same-number repeat at 69 s and process survival are documented in the device writeup; the two captures are separate cold launches."
-    },
-    "restricted-sharing-mode": {
-      "code": 5,
-      "delaySeconds": 2.07,
-      "verification": "unverified",
-      "evidence": [
-        "docs/research/callkit-simulator-probe/livecommunicationkit/push/README.md"
-      ],
-      "scope": "Unverified on device. NSError code follows the public incoming-call error identity; 2.07 s is explicit simulator policy borrowed from measured DND timing, not a measurement for this reason."
-    },
-    "call-is-protected": {
-      "code": 6,
-      "delaySeconds": 2.07,
-      "verification": "unverified",
-      "evidence": [
-        "docs/research/callkit-simulator-probe/livecommunicationkit/push/README.md"
-      ],
-      "scope": "Unverified on device. NSError code follows the public incoming-call error identity; 2.07 s is explicit simulator policy borrowed from measured DND timing, not a measurement for this reason."
-    },
-    "sensitive-participants": {
-      "code": 7,
-      "delaySeconds": 2.07,
-      "verification": "unverified",
-      "evidence": [
-        "docs/research/callkit-simulator-probe/livecommunicationkit/push/README.md"
-      ],
-      "scope": "Unverified on device. NSError code follows the public incoming-call error identity; 2.07 s is explicit simulator policy borrowed from measured DND timing, not a measurement for this reason."
-    }
-  },
-  "lckBlockedNumberEvidence": {
-    "verification": "measured-negative",
-    "sourceIssue": 85,
-    "incomingErrorCode": 0,
-    "repeatAfterSeconds": 66,
-    "ringTimeoutSeconds": 60,
-    "captures": {
-      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/filter-block.jsonl": "c52e5be2086fd2c14ec3ef4ae1d580ebd9594486d08aeba16d28be7d96229719",
-      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/filter-block-check.jsonl": "b41172c83eea3febb80c8d0f1172348fb4ad399aadda09a9342b2c4ed8c91828"
-    },
-    "scope": "The blocked number reported successfully and rang. Code 4 is not produced by iOS 27.0 for LCK in these measurements; runtime code 4 is an explicit injectable fault only."
   }
 }
 """#
@@ -947,17 +826,8 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
         owner.generation += 1; owner.valid = true
         callback(owner) { $0.providerDidBegin?(provider) }
       }
-      let enteredAt = DispatchTime.now()
-      let reportID = UUID().uuidString
-      let outcome = IncomingReportOutcome(reason: incomingFilter, duplicate: calls[uuid] != nil,
-        policy: profile.incomingFilterPolicies[incomingFilter.rawValue],
-        normalDelaySeconds: ProcessInfo.processInfo.environment["CKSIM_LATENCY"] == "device" ? profile.reportLatencySeconds : 0.02,
-        extraDelaySeconds: Double(faults.reportCallbackDelayMS ?? 0) / 1000, incomingErrorCode: faults.incomingErrorCode ?? 0)
-      let error = outcome.error
-      let fields: [String: Any] = ["reportID": reportID, "callUUID": uuid.uuidString, "pushID": pushID,
-        "domain": outcome.domain, "code": outcome.code, "filterReason": outcome.filterReason,
-        "verification": outcome.verification, "latencyMS": 0]
-      record(event: "report.incoming", fields: fields)
+      record(event: "report.incoming", fields: ["callUUID": uuid.uuidString, "pushID": pushID])
+      let error: NSError? = calls[uuid] == nil ? nil : NSError(domain: "com.apple.CallKit.error.incomingcall", code: 2)
       if error == nil {
         let call = CallState(uuid, owner); call.update = update.copy() as? CXCallUpdate; call.pushID = pushID
         calls[uuid] = call; changed(call)
@@ -966,13 +836,12 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
           self.deliver([CXEndCallAction(call: uuid)], self.selected ?? owner, origin: .system)
         }
       }
-      after(outcome.delaySeconds) {
+      let delay = (ProcessInfo.processInfo.environment["CKSIM_LATENCY"] == "device" ? profile.reportLatencySeconds : 0.02)
+        + Double(faults.reportCallbackDelayMS) / 1000
+      after(delay) {
         (owner.queue ?? .main).async {
           guard self.withState({ !self.stopped }) else { return }
-          self.record(event: "report.completed", fields: ["reportID": reportID, "callUUID": uuid.uuidString, "pushID": pushID,
-            "domain": outcome.domain, "code": outcome.code, "error": outcome.code, "filterReason": outcome.filterReason,
-            "verification": outcome.verification,
-            "latencyMS": Double(DispatchTime.now().uptimeNanoseconds - enteredAt.uptimeNanoseconds) / 1_000_000])
+          self.record(event: "report.completed", fields: ["callUUID": uuid.uuidString, "pushID": pushID, "error": error?.code ?? 0])
           reply.invoke(error)
         }
       }
@@ -1058,7 +927,7 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
       }
       return
     }
-    if desired && faults.staleAudio == true { record(event: "fault.audioSuppressed", fields: [:]); return }
+    if desired && faults.staleAudio { record(event: "fault.audioSuppressed", fields: [:]); return }
     DispatchQueue.main.async {
       guard self.withState({ !self.stopped && self.audioRevision == revision }) else { return }
       do {
@@ -1125,32 +994,16 @@ final class RuntimeEngine: NSObject, CKRuntimeEngineProtocol, @unchecked Sendabl
   }
   private func execute(_ command: Command, _ object: [String: Any]) throws -> [String: Any] {
     switch command.operation {
-    case "status": return ["calls": calls.values.map(callJSON), "pending": pendingActions.values.filter { !$0.settled }.count, "audioActive": audioActive, "sequence": sequence,
-      "incomingErrorCode": faults.incomingErrorCode ?? 0,
-      "incomingFilter": incomingFilter.snapshot(policy: profile.incomingFilterPolicies[incomingFilter.rawValue])]
+    case "status": return ["calls": calls.values.map(callJSON), "pending": pendingActions.values.filter { !$0.settled }.count, "audioActive": audioActive, "sequence": sequence]
     case "events": return ["events": (try? String(contentsOf: controlRoot.appendingPathComponent("events.jsonl"), encoding: .utf8)) ?? ""]
     case "inspect-adapter":
       let name = "CallKitVoIPPushDelegate"
       let selector = NSSelectorFromString("pushRegistry:didReceiveIncomingVoIPPushWithPayload:metadata:withCompletionHandler:")
       guard let cls = NSClassFromString(name) else { throw ControlError.invalid("adapter class missing") }
       return ["metadataSelector": class_getInstanceMethod(cls, selector) != nil]
-    case "incoming-filter":
-      guard let rawReason = command.reason, let reason = IncomingFilterReason(rawValue: rawReason) else {
-        throw ControlError.invalid("valid incoming filter reason required")
-      }
-      incomingFilter = reason
-      let snapshot = reason.snapshot(policy: profile.incomingFilterPolicies[reason.rawValue])
-      var fields = snapshot
-      fields["requestID"] = command.id.uuidString
-      record(event: "incomingFilter.configured", fields: fields)
-      return ["incomingFilter": snapshot]
     case "faults":
-      guard let value = command.faults, (0...120_000).contains(value.reportCallbackDelayMS ?? 0),
-        [0, 4].contains(value.incomingErrorCode ?? 0) else { throw ControlError.invalid("invalid faults") }
-      faults.apply(value)
-      let code = faults.incomingErrorCode ?? 0
-      record(event: "faults.configured", fields: ["requestID": command.id.uuidString, "incomingErrorCode": code])
-      return ["configured": true, "incomingErrorCode": code]
+      guard let value = command.faults, (0...120_000).contains(value.reportCallbackDelayMS) else { throw ControlError.invalid("invalid faults") }
+      faults = value; return ["configured": true]
     case "push":
       guard let payload = object["payload"] as? [String: Any], let mustReport = command.mustReport else { throw ControlError.invalid("payload and explicit mustReport required") }
       let bytes = try JSONSerialization.data(withJSONObject: payload)

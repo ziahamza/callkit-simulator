@@ -146,45 +146,10 @@ the push callback have no inferred push correlation.
 `faults --report-delay-ms 1500` delays incoming-report completion so tests can
 answer or decline before it returns. `faults --stale-audio` suppresses activation
 to exercise recovery from missing audio activation. Calling `faults` without
-flags clears all faults; with flags, omitted settings stay unchanged.
-`--invalidate-during-handoff` invalidates the selected
+flags clears the faults. `--invalidate-during-handoff` invalidates the selected
 provider during the next system Hold/End & Accept transaction, for lifecycle
 recovery tests. A command timeout is an unknown outcome: query
 `status`/`events` before retrying an externally visible action.
-
-Incoming-report filtering is a persistent setting for the current runtime
-session, separate from faults. The Inspector exposes the same mutually exclusive
-toggles as the CLI:
-
-```sh
-cksim --bundle com.example.app incoming-filter --reason do-not-disturb
-cksim --bundle com.example.app incoming-filter --reason none
-```
-
-| Reason flag | Incoming-call error code | Device qualification |
-| --- | --- | --- |
-| `do-not-disturb` | 3 | Measured: about 2.07 s to error; process survives; same-number repeat after 69 s still filtered |
-| `restricted-sharing-mode` | 5 | Unverified |
-| `call-is-protected` | 6 | Unverified |
-| `sensitive-participants` | 7 | Unverified |
-
-Errors use `com.apple.CallKit.error.incomingcall`. Each report snapshots the
-selected filter and callback delay when it enters; later settings affect future
-reports. Filtered reports create no call, ring timer or audio activation. Codes
-5–7 currently reuse the 2.07 s delay as explicitly unverified simulator policy.
-The [device capture](research/callkit-simulator-probe/livecommunicationkit/push/README.md)
-is the reference for code 3; filtering never grants a repeated-caller exception.
-The [blocked-number LCK measurements](research/callkit-simulator-probe/livecommunicationkit/multicall/README.md)
-([#85](https://github.com/ziahamza/ios-voip-sdk/pull/85)) succeeded and rang; a repeat
-66 seconds later also succeeded, with the unanswered call ending at about 60 s.
-Code 4 is not produced by iOS 27.0 for LCK in these measurements. It is available
-only as an explicit fault: `faults --incoming-error-code 4`; use `0` to clear it.
-The Inspector labels it separately as an injected error. Its callback uses the
-normal configured delay, not the measured DND delay. Journals identify it with
-`verification: injected-fault` and `filterReason: none`. Duplicate UUID code 2
-still takes priority. Each entered report retains its fault/filter snapshot.
-The native acceptance checks actual completion NSError callbacks for filters
-3/5–7 and injected fault 4, live mailbox survival beyond 4.4 s, and a 69-second repeat.
 
 For direct launch customization, the process environment accepts `CKSIM_RUN_ID`,
 `CKSIM_PROFILE=ios-27.0` and `CKSIM_LATENCY=device`. `CKSIM_SHADOW=1` additionally

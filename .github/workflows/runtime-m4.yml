@@ -2,9 +2,9 @@ name: Runtime event stream and inspector
 on:
   push:
     branches: [main]
-    paths: ["Sources/Engine/**", "Sources/Interposition/**", "Tools/**", "Inspector/**", "Tests/RuntimeEvents/**", "Tests/Inspector/**", "scripts/build-runtime.sh", "scripts/build-inspector.sh", ".github/workflows/runtime-m4.yml", "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/**"]
+    paths: ["Sources/Engine/**", "Sources/Interposition/**", "Tools/**", "Inspector/**", "Tests/RuntimeEvents/**", "Tests/Inspector/**", "scripts/build-runtime.sh", "scripts/build-inspector.sh", ".github/workflows/runtime-m4.yml"]
   pull_request:
-    paths: ["Sources/Engine/**", "Sources/Interposition/**", "Tools/**", "Inspector/**", "Tests/RuntimeEvents/**", "Tests/Inspector/**", "scripts/build-runtime.sh", "scripts/build-inspector.sh", ".github/workflows/runtime-m4.yml", "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/**"]
+    paths: ["Sources/Engine/**", "Sources/Interposition/**", "Tools/**", "Inspector/**", "Tests/RuntimeEvents/**", "Tests/Inspector/**", "scripts/build-runtime.sh", "scripts/build-inspector.sh", ".github/workflows/runtime-m4.yml"]
   workflow_dispatch:
 permissions:
   contents: read
@@ -32,14 +32,9 @@ jobs:
           python3 Tests/RuntimeEvents/test_watch.py
           python3 Tests/RuntimeEvents/test_native_runner.py
           python3 Tests/RuntimeEvents/test_ci_simulator.py
-          python3 Tests/RuntimeEvents/test_filtered_policy.py
-          python3 Tests/RuntimeEvents/test_filtered_acceptance.py
-          python3 Tests/RuntimeEvents/test_lck_acceptance.py
           python3 Tests/Inspector/test_bridge.py
           python3 Tests/Inspector/test_timing_references.py
           python3 Tests/Inspector/test_timing_receipts.py
-          python3 Tests/Inspector/test_incoming_filter.py
-          python3 Tests/Inspector/test_filter_model.py
           python3 discovery/check_cli_controls.py
           python3 discovery/check_lck_provider_policy.py
       - name: Build simulator runtime and event fixture
@@ -47,7 +42,6 @@ jobs:
           set -o pipefail
           CKSIM_BUILD_ARCHS="$(uname -m)" bash scripts/build-runtime.sh "$RUNNER_TEMP/runtime" 2>&1 | tee "$RUNNER_TEMP/m4-build/runtime.log"
           bash Tests/RuntimeEvents/build.sh "$RUNNER_TEMP/fixture" 2>&1 | tee "$RUNNER_TEMP/m4-build/fixture.log"
-          bash Tests/RuntimeEvents/build-lck.sh "$RUNNER_TEMP/lck-fixture" 2>&1 | tee "$RUNNER_TEMP/m4-build/lck-fixture.log"
           bash scripts/build-inspector.sh "$RUNNER_TEMP/inspector" 2>&1 | tee "$RUNNER_TEMP/m4-build/inspector.log"
       - name: Create the single owned simulator
         run: |
@@ -58,17 +52,13 @@ jobs:
           python3 Tests/RuntimeEvents/run.py --package "$RUNNER_TEMP/runtime" \
             --app "$RUNNER_TEMP/fixture/RuntimeEventFixture.app" --out "$RUNNER_TEMP/m4-events" \
             --runtime "$CKSIM_TEST_RUNTIME" --simulator "$CKSIM_TEST_SIMULATOR"
-      - name: Verify genuine LCK report and explicit code-4 fault
-        run: |
-          python3 Tests/RuntimeEvents/lck_acceptance.py --app "$RUNNER_TEMP/lck-fixture/LCKRuntimeFixture.app" \
-            --out "$RUNNER_TEMP/m4-lck" --filter-only --simulator "$CKSIM_TEST_SIMULATOR"
       - name: Follow an incoming call through the live SwiftUI inspector
         run: |
           python3 Tests/Inspector/run.py --package "$RUNNER_TEMP/runtime" \
             --fixture "$RUNNER_TEMP/fixture/RuntimeEventFixture.app" \
             --inspector "$RUNNER_TEMP/inspector/CKSimInspector.app" --out "$RUNNER_TEMP/m4-inspector" \
             --runtime "$CKSIM_TEST_RUNTIME" --driver journal \
-            --target-simulator "$CKSIM_TEST_SIMULATOR" --fixture-installed --verify-filter-controls
+            --target-simulator "$CKSIM_TEST_SIMULATOR" --fixture-installed
       - name: Delete the owned simulator
         if: always()
         run: python3 Tests/RuntimeEvents/ci_simulator.py cleanup --id-file "$RUNNER_TEMP/m4-simulator-id"
@@ -80,11 +70,10 @@ jobs:
             ${{ runner.temp }}/m4-build
             ${{ runner.temp }}/m4-events
             ${{ runner.temp }}/m4-inspector
-            ${{ runner.temp }}/m4-lck
             ${{ runner.temp }}/m4-simulator-id
             !${{ runner.temp }}/m4-inspector/ui-build
           if-no-files-found: warn
           retention-days: 7
       - name: Remove generated builds
         if: always()
-        run: rm -rf "$RUNNER_TEMP/runtime" "$RUNNER_TEMP/fixture" "$RUNNER_TEMP/lck-fixture" "$RUNNER_TEMP/inspector" "$RUNNER_TEMP/m4-inspector/ui-build"
+        run: rm -rf "$RUNNER_TEMP/runtime" "$RUNNER_TEMP/fixture" "$RUNNER_TEMP/inspector" "$RUNNER_TEMP/m4-inspector/ui-build"

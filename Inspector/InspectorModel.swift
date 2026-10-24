@@ -15,12 +15,7 @@ private struct EventBatch: Decodable {
   let cursor: Int
 }
 private struct ControlResult: Decodable {
-  struct Result: Decodable {
-    var actionIDs: [String]?
-    var incomingFilter: InspectorIncomingFilterState?
-    var incomingErrorCode: Int?
-  }
-  var id: String?
+  struct Result: Decodable { var actionIDs: [String]? }
   let success: Bool
   var error: String?
   var result: Result?
@@ -45,8 +40,6 @@ private struct InspectorProbeSnapshot: Encodable {
   let timelinePresentation: [TimelinePresentation]
   let timingReferences: [RuntimeTimingReadout]
   let audioActive: Bool
-  let incomingFilter: InspectorIncomingFilter
-  let incomingErrorCode: Int
   let online: Bool
   let error: String?
 }
@@ -62,8 +55,6 @@ final class InspectorModel: ObservableObject {
   @Published var busy = false
   @Published var error: String?
   @Published var commandError: String?
-  @Published var incomingFilter: InspectorIncomingFilter = .none
-  @Published var incomingErrorCode = 0
   private var cursor = 0
   private var acknowledgedActions = Set<String>()
   private var actionOrder: [String] = []
@@ -144,7 +135,7 @@ final class InspectorModel: ObservableObject {
       pending: pending.values.sorted { $0.sequence < $1.sequence }, timeline: timeline,
       timelinePresentation: timeline.map { .init(sequence: $0.sequence, title: $0.title, detail: $0.detail) },
       timingReferences: timingReferences,
-      audioActive: audioActive, incomingFilter: incomingFilter, incomingErrorCode: incomingErrorCode, online: online, error: error)
+      audioActive: audioActive, online: online, error: error)
     do {
       try FileManager.default.createDirectory(at: documents, withIntermediateDirectories: true)
       try JSONEncoder().encode(snapshot).write(to: documents.appendingPathComponent("cksim-inspector-results.json"), options: .atomic)
@@ -158,60 +149,16 @@ final class InspectorModel: ObservableObject {
       let ended = conversations.values.filter { $0.ended == true }.sorted { $0.sequence > $1.sequence }
       for old in ended.dropFirst(5) { if let id = old.uuid { conversations.removeValue(forKey: id) } }
     }
-    if let state = InspectorIncomingFilterState(event: row), let id = row.requestID {
-      incomingFilter = state.reason
-      acknowledge(id)
-    }
-    if row.event == "faults.configured", let code = row.incomingErrorCode, [0, 4].contains(code),
-       let id = row.requestID, !id.isEmpty {
-      incomingErrorCode = code
-      acknowledge(id)
-    }
     if let id = row.actionID {
-      acknowledge(id)
+      if acknowledgedActions.insert(id).inserted {
+        actionOrder.append(id)
+        if actionOrder.count > 1000 { acknowledgedActions.remove(actionOrder.removeFirst()) }
+      }
       if row.event == "action.deadline" { pending[id] = row }
       if ["action.settled", "action.expired", "action.timeout", "action.cancelled"].contains(row.event) { pending.removeValue(forKey: id) }
     }
     if row.event == "audio.activated" { audioActive = true }
     if row.event == "audio.deactivated" { audioActive = false }
-  }
-  private func acknowledge(_ id: String) {
-    if acknowledgedActions.insert(id).inserted {
-      actionOrder.append(id)
-      if actionOrder.count > 1000 { acknowledgedActions.remove(actionOrder.removeFirst()) }
-    }
-  }
-  func configureIncomingFilter(_ reason: InspectorIncomingFilter) {
-    submitConfiguration(["operation": "incoming-filter", "reason": reason.rawValue]) {
-      $0.incomingFilter?.isValid == true && $0.incomingFilter?.reason == reason
-    }
-  }
-  func configureIncomingError(_ code: Int) {
-    guard [0, 4].contains(code) else { return }
-    submitConfiguration(["operation": "faults", "incomingErrorCode": String(code)]) { $0.incomingErrorCode == code }
-  }
-  private func submitConfiguration(_ body: [String: String], accepting: @escaping (ControlResult.Result) -> Bool) {
-    guard !busy, online else { return }
-    busy = true
-    Task {
-      defer { busy = false }
-      do {
-        let response = try JSONDecoder().decode(ControlResult.self, from: await request("/command",
-          body: body))
-        guard response.success, let id = response.id, !id.isEmpty, let result = response.result, accepting(result) else {
-          throw NSError(domain: "Inspector", code: 5, userInfo: [NSLocalizedDescriptionKey:
-            response.error ?? "Runtime rejected the configuration."])
-        }
-        let deadline = Date().addingTimeInterval(3)
-        while !acknowledgedActions.contains(id) {
-          guard Date() < deadline else {
-            throw NSError(domain: "Inspector", code: 6, userInfo: [NSLocalizedDescriptionKey:
-              "Configuration accepted, but its journal confirmation has not arrived. Check the timeline before retrying."])
-          }
-          try await Task.sleep(for: .milliseconds(25))
-        }
-      } catch { commandError = error.localizedDescription }
-    }
   }
   func send(_ operation: String, call: RuntimeEvent, active: RuntimeEvent? = nil) {
     guard !busy, online, let id = call.uuid else { return }

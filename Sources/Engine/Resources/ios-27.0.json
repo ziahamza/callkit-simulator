@@ -55,57 +55,5 @@
       "docs/research/callkit-simulator-probe/livecommunicationkit/push/2026-10-23-iphone13-ios27-late-report-3s.jsonl": "1ed65280b43ebe27ab8b52535bb7b1df15b301e4eb9ab6d690cc9c8690ef36cf",
       "docs/research/callkit-simulator-probe/livecommunicationkit/push/2026-10-23-iphone13-ios27-late-report-5s.jsonl": "65aa587060ac3a2e5a898d97675e0c902dba70d7c8bf0b2d7dad0ab8ad29da2c"
     }
-  },
-  "incomingFilterPolicies": {
-    "do-not-disturb": {
-      "code": 3,
-      "delaySeconds": 2.07,
-      "verification": "verified",
-      "evidence": [
-        "docs/research/callkit-simulator-probe/livecommunicationkit/push/2026-10-23-iphone13-ios27-d3-cold-unlocked-entered.jsonl",
-        "docs/research/callkit-simulator-probe/livecommunicationkit/push/2026-10-23-iphone13-ios27-d3-cold-unlocked-entered-repeat.jsonl",
-        "docs/research/callkit-simulator-probe/livecommunicationkit/push/README.md"
-      ],
-      "scope": "D3 report errors measured at 2.081 s and 2.070 s. Same-number repeat at 69 s and process survival are documented in the device writeup; the two captures are separate cold launches."
-    },
-    "restricted-sharing-mode": {
-      "code": 5,
-      "delaySeconds": 2.07,
-      "verification": "unverified",
-      "evidence": [
-        "docs/research/callkit-simulator-probe/livecommunicationkit/push/README.md"
-      ],
-      "scope": "Unverified on device. NSError code follows the public incoming-call error identity; 2.07 s is explicit simulator policy borrowed from measured DND timing, not a measurement for this reason."
-    },
-    "call-is-protected": {
-      "code": 6,
-      "delaySeconds": 2.07,
-      "verification": "unverified",
-      "evidence": [
-        "docs/research/callkit-simulator-probe/livecommunicationkit/push/README.md"
-      ],
-      "scope": "Unverified on device. NSError code follows the public incoming-call error identity; 2.07 s is explicit simulator policy borrowed from measured DND timing, not a measurement for this reason."
-    },
-    "sensitive-participants": {
-      "code": 7,
-      "delaySeconds": 2.07,
-      "verification": "unverified",
-      "evidence": [
-        "docs/research/callkit-simulator-probe/livecommunicationkit/push/README.md"
-      ],
-      "scope": "Unverified on device. NSError code follows the public incoming-call error identity; 2.07 s is explicit simulator policy borrowed from measured DND timing, not a measurement for this reason."
-    }
-  },
-  "lckBlockedNumberEvidence": {
-    "verification": "measured-negative",
-    "sourceIssue": 85,
-    "incomingErrorCode": 0,
-    "repeatAfterSeconds": 66,
-    "ringTimeoutSeconds": 60,
-    "captures": {
-      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/filter-block.jsonl": "c52e5be2086fd2c14ec3ef4ae1d580ebd9594486d08aeba16d28be7d96229719",
-      "docs/research/callkit-simulator-probe/livecommunicationkit/multicall/filter-block-check.jsonl": "b41172c83eea3febb80c8d0f1172348fb4ad399aadda09a9342b2c4ed8c91828"
-    },
-    "scope": "The blocked number reported successfully and rang. Code 4 is not produced by iOS 27.0 for LCK in these measurements; runtime code 4 is an explicit injectable fault only."
   }
 }
