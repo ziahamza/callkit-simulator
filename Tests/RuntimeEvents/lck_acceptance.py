@@ -22,6 +22,20 @@ RUNTIME = 'com.apple.CoreSimulator.SimRuntime.iOS-27-0'
 PREFIX = 'lck.fixture.'
 
 
+def verify_barrier(rows, accepted, action_ids):
+    terminal = [(index, r) for index, r in enumerate(rows) if r['event'] in (PREFIX + 'settled', PREFIX + 'timedOut') and r.get('actionID') in action_ids]
+    assert {r['actionID'] for _, r in terminal} == action_ids, 'missing constituent settlement'
+    joined = next(index for index, r in enumerate(rows) if r['event'] == PREFIX + 'changed' and r.get('callUUID') == accepted and r.get('state') == 'joined')
+    assert joined > max(index for index, _ in terminal), 'accepted Join happened before every constituent settled'
+
+
+def verify_timeout(delivered, expired, kind):
+    assert 29000 <= delivered['advertisedRemainingMS'] <= 31000, 'LCK must still advertise 30 seconds'
+    elapsed = expired['t_ms'] - delivered['t_ms']
+    low, high = (63000, 68000) if kind == 'Join' else (5000, 8500)
+    assert low <= elapsed <= high, f'{kind} effective timeout {elapsed}ms outside measured scheduling budget'
+
+
 def snapshot_matches(rows, expected):
     snapshots = [r for r in rows if r['event'] == PREFIX + 'snapshot']
     if not snapshots:
@@ -29,6 +43,14 @@ def snapshot_matches(rows, expected):
     actual = {c['callUUID']: c['state'] for c in snapshots[-1]['conversations']}
     return all(actual.get(identifier) == state or state == 'left' and identifier not in actual
                for identifier, state in expected.items())
+
+
+def verify_unchanged(rows, expected):
+    for row in rows:
+        if row['event'] == PREFIX + 'changed' and row.get('callUUID') in expected:
+            assert row['state'] == expected[row['callUUID']], 'merge/unmerge changed native LCK state'
+        if row['event'] == PREFIX + 'snapshot':
+            assert snapshot_matches([row], expected), 'merge/unmerge changed manager snapshot'
 
 
 class Journey:
@@ -150,6 +172,12 @@ class Journey:
         result = self.system(operation, call=call, active=active, held=held)
         ids = set(result['actionIDs'])
         rows = self.wait(lambda rows: rows if ids <= {r.get('actionID') for r in rows[start:] if r['event'] == PREFIX + 'perform'} else None)
+        native = [r for r in rows[start:] if r['event'] == PREFIX + 'perform' and r.get('actionID') in ids]
+        expected = {('Join', self.ids[call]), ('Pause' if operation != 'end-and-accept' else 'End', self.ids[active])}
+        if held:
+            expected.add(('End', self.ids[held]))
+        assert {(r['kind'], r['callUUID']) for r in native} == expected, 'unexpected native composite constituents'
+        assert max(r['t_ms'] for r in native) - min(r['t_ms'] for r in native) < 100, 'native composite deliveries separated'
         runtime = [r for r in rows[start:] if r['event'] == 'action.deadline' and r.get('actionID') in ids]
         assert len(runtime) == len(ids) and len({r['transactionID'] for r in runtime}) == 1, 'modeled system envelope must be shared'
         assert all(r['apiKind'] == 'livecommunicationkit' for r in runtime)
@@ -168,6 +196,125 @@ class Journey:
         (out / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
         callbacks = [r for r in rows if r['event'].startswith(PREFIX)]
         assert callbacks and all(r.get('main') is True for r in callbacks), 'LCK callbacks must arrive on main'
+
+
+def run_cases(journey, *, full_timeout=False):
+    j = journey
+    j.pair('latePause2s')
+    assert j.choices('B') == {'hold-and-accept', 'end-and-accept', 'decline'}
+    j.app('policy', rules={'Pause': dict(mode='delay', ms=2000)})
+    ids = j.composite()
+    rows = j.state(A='paused', B='joined')
+    verify_barrier(rows, j.ids['B'], ids)
+    pause = next(r for r in rows if r['event'] == PREFIX + 'settled' and r['kind'] == 'Pause')
+    delivered_pause = next(r for r in rows if r['event'] == PREFIX + 'perform' and r['actionID'] == pause['actionID'])
+    assert 1900 <= pause['t_ms'] - delivered_pause['t_ms'] < 5000, 'late Pause fixture must actually settle about 2s late'
+    paused = next(r for r in rows if r['event'] == PREFIX + 'changed' and r.get('callUUID') == j.ids['A'] and r['state'] == 'paused')
+    assert paused['t_ms'] < pause['t_ms'], 'pause state must precede delayed fulfillment'
+    j.pair('reversedSettlement')
+    j.app('policy', rules={kind: dict(mode='reverse', ms=630) for kind in ('Pause', 'Join')})
+    ids = j.composite()
+    rows = j.state(A='paused', B='joined')
+    verify_barrier(rows, j.ids['B'], ids)
+    settled = [r['kind'] for r in rows if r['event'] == PREFIX + 'settled' and r.get('actionID') in ids]
+    assert settled == ['Join', 'Pause'], settled
+    for name, operation, failing, expected in (
+        ('failedPause', 'hold-and-accept', 'Pause', dict(A='left', B='joined')),
+        ('failedJoinHeld', 'hold-and-accept', 'Join', dict(A='paused', B='left')),
+        ('failedEnd', 'end-and-accept', 'End', dict(A='left', B='joined')),
+        ('failedJoinEnded', 'end-and-accept', 'Join', dict(A='left', B='left'))):
+        j.pair(name)
+        j.app('policy', rules={failing: dict(mode='fail', nth=1)})
+        ids = j.composite(operation)
+        rows = j.state(**expected)
+        if failing in ('Pause', 'Join'):
+            target = j.ids['A' if failing == 'Pause' else 'B']
+            j.wait(lambda rows: any(r['event'] == PREFIX + 'perform' and r['kind'] == 'End' and
+                                   r['callUUID'] == target and r['actionID'] not in ids for r in rows))
+        if expected.get('B') == 'joined':
+            verify_barrier(rows, j.ids['B'], ids)
+        if expected.get('A') == 'paused':
+            time.sleep(0.3)
+            assert j.states(j.rows())['A'] == 'paused', 'failed Join must not resume held A'
+    timeouts = [('pendingPause', 'hold-and-accept', 'Pause', dict(A='left', B='joined')),
+                ('pendingEnd', 'end-and-accept', 'End', dict(A='left', B='joined'))]
+    if full_timeout:
+        timeouts.append(('pendingJoin64s', 'hold-and-accept', 'Join', dict(A='paused', B='left')))
+    for name, operation, kind, expected in timeouts:
+        j.pair(name)
+        j.app('policy', rules={kind: dict(mode='pending', nth=1)})
+        ids = j.composite(operation)
+        delivered = j.wait(lambda rows: next((r for r in rows if r['event'] == PREFIX + 'perform' and r.get('actionID') in ids and r['kind'] == kind), None))
+        expired = j.wait(lambda rows: next((r for r in rows if r['event'] == PREFIX + 'timedOut' and r.get('actionID') == delivered['actionID']), None), timeout=70 if kind == 'Join' else 12)
+        verify_timeout(delivered, expired, kind)
+        rows = j.state(**expected)
+        if kind in ('Pause', 'Join'):
+            target = j.ids['A' if kind == 'Pause' else 'B']
+            j.wait(lambda rows: any(r['event'] == PREFIX + 'perform' and r['kind'] == 'End' and
+                                   r['callUUID'] == target and r['actionID'] not in ids for r in rows))
+        if expected.get('B') == 'joined':
+            verify_barrier(rows, j.ids['B'], ids)
+    j.pair('capabilitiesNone', caps='none')
+    assert 'hold-and-accept' in j.choices('B')
+    j.composite()
+    j.state(A='paused', B='joined')
+    j.app('pause', call='B', paused=True)
+    j.state(A='paused', B='paused')
+    j.pair('capsToggle')
+    j.app('caps', call='A', capabilities=[])
+    assert 'hold-and-accept' in j.choices('B')
+    j.composite()
+    j.state(A='paused', B='joined')
+    j.app('caps', call='B', capabilities=[])
+    j.app('pause', call='B', paused=True)
+    j.state(A='paused', B='paused')
+    j.pair('mergeUnmerge', per_group=2)
+    j.composite()
+    j.state(A='paused', B='joined')
+    for operation, fields in (('merge', dict(call='B', other='A')), ('merge', dict(call='A', other='B')),
+                              ('unmerge', dict(call='A')), ('unmerge', dict(call='B'))):
+        start = len(j.rows())
+        j.app(operation, **fields)
+        j.wait(lambda rows: any(r['event'] == PREFIX + 'settled' and r['kind'] == operation.capitalize() for r in rows[start:]))
+        time.sleep(0.2)
+        j.app('snapshot')
+        verify_unchanged(j.rows()[start:], {j.ids['A']: 'paused', j.ids['B']: 'joined'})
+    j.app('incoming', call='C')
+    assert j.choices('C') == {'end-and-accept', 'end-held-and-accept', 'decline'}
+    result = j.app('start', call='D', expect_success=False)
+    assert (result['errorDomain'], result['errorCode']) == ('com.apple.CallKit.error.requesttransaction', 7)
+    ids = j.composite('end-held-and-accept', call='C', active='B', held='A')
+    j.state(A='left', B='paused', C='joined')
+    j.pair('thirdEndActive')
+    j.composite()
+    j.state(A='paused', B='joined')
+    j.app('incoming', call='C')
+    j.composite('end-and-accept', call='C', active='B')
+    j.state(A='paused', B='left', C='joined')
+    j.begin('unmergeSingleton', per_group=2)
+    j.app('incoming', call='A')
+    j.system('answer', call='A')
+    j.state(A='joined')
+    start = len(j.rows())
+    j.app('unmerge', call='A')
+    j.wait(lambda rows: any(r['event'] == PREFIX + 'settled' and r['kind'] == 'Unmerge' for r in rows[start:]))
+    time.sleep(0.2)
+    j.app('snapshot')
+    verify_unchanged(j.rows()[start:], {j.ids['A']: 'joined'})
+    j.pair('resumeEndsActive')
+    j.composite()
+    j.state(A='paused', B='joined')
+    start = len(j.rows())
+    j.app('pause', call='A', paused=False)
+    rows = j.state(A='joined', B='left')
+    observed = [r for r in rows[start:] if r['event'] == PREFIX + 'perform' and r['callUUID'] == j.ids['B']]
+    assert [r['kind'] for r in observed] == ['End'], 'resume must end active B, not pause it'
+    for per_group in (1, 2):
+        j.pair('oneGroup' + str(per_group), groups=1, per_group=per_group)
+        assert j.choices('B') == {'end-and-accept', 'decline'}
+        result = j.app('start', call='C', expect_success=False)
+        assert (result['errorDomain'], result['errorCode']) == ('com.apple.CallKit.error.requesttransaction', 7)
+    j.save()
 
 
 def run_filter_case(j):
@@ -193,6 +340,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--app', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--full-timeout', action='store_true', help='Also observe one full ~64s pending Join')
     parser.add_argument('--filter-only', action='store_true', help='Normal report → explicit incoming code4 → cleared normal report')
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -207,9 +355,13 @@ def main():
         run('xcrun', 'simctl', 'install', device, args.app.resolve(), timeout=120)
         container = Path(run('xcrun', 'simctl', 'get_app_container', device, BUNDLE, 'data', timeout=60))
         journey = Journey(device, container, args.out)
-        run_filter_case(journey)
+        if args.filter_only:
+            run_filter_case(journey)
+        else:
+            run_cases(journey, full_timeout=args.full_timeout)
         print(json.dumps(dict(success=True, fixture='genuine ConversationManager', runtime=RUNTIME,
-                              mode='explicit-incoming-fault')))
+                              mode='explicit-incoming-fault' if args.filter_only else 'measured-multicall',
+                              fullJoinTimeout=args.full_timeout, choicesAndTransactionIDs='modeled policy assertions')))
     finally:
         failed = sys.exc_info()[0] is not None
         try:

@@ -21,7 +21,9 @@ final class LCKFixture: NSObject, UIApplicationDelegate, @preconcurrency Convers
   func application(_ app: UIApplication, didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
     guard RuntimeBootstrap.activate() else { fatalError("LCK fixture runtime refused") }
     let env = ProcessInfo.processInfo.environment
-    if env["LCK_FIXTURE_CAPABILITIES"] == "none" { capabilities = [] }
+    if let names = env["LCK_FIXTURE_CAPABILITIES"], names != "all" {
+      capabilities = selectedCapabilities(names.split(separator: ",").map(String.init))
+    }
     manager = ConversationManager(configuration: .init(ringtoneName: nil, iconTemplateImageData: nil,
       maximumConversationGroups: Int(env["LCK_FIXTURE_GROUPS"] ?? "2") ?? 2,
       maximumConversationsPerConversationGroup: Int(env["LCK_FIXTURE_PER_GROUP"] ?? "1") ?? 1,
@@ -33,6 +35,12 @@ final class LCKFixture: NSObject, UIApplicationDelegate, @preconcurrency Convers
     }
     log("ready")
     return true
+  }
+  func selectedCapabilities(_ names: [String]) -> Conversation.Capabilities {
+    var result: Conversation.Capabilities = []
+    let options: [(String, Conversation.Capabilities)] = [("pausing", .pausing), ("merging", .merging), ("unmerging", .unmerging)]
+    for (name, capability) in options where names.contains(name) { result.insert(capability) }
+    return result
   }
   func log(_ event: String, _ fields: [String: Any] = [:]) {
     var value = fields
@@ -72,6 +80,8 @@ final class LCKFixture: NSObject, UIApplicationDelegate, @preconcurrency Convers
       case "incoming":
         let number = value["handle"] as? String
         let handle = Handle(type: number == nil ? .generic : .phoneNumber, value: number ?? name, displayName: "LCK " + name)
+        log("reportStarted", ["requestID": requestID, "callUUID": id.uuidString,
+                              "handleType": number == nil ? "generic" : "phoneNumber", "handleValue": handle.value])
         try await manager.reportNewIncomingConversation(uuid: id, update: .init(members: [handle], capabilities: capabilities))
       case "start": action = StartConversationAction(conversationUUID: id, handles: [Handle(type: .generic, value: name)], isVideo: false)
       case "pause": action = PauseConversationAction(conversationUUID: id, isPaused: value["paused"] as? Bool ?? true)
@@ -80,6 +90,9 @@ final class LCKFixture: NSObject, UIApplicationDelegate, @preconcurrency Convers
         guard let other = ids[value["other"] as? String ?? ""] else { throw CocoaError(.validationMissingMandatoryProperty) }
         action = MergeConversationAction(conversationUUID: id, conversationUUIDToMergeWith: other)
       case "unmerge": action = UnmergeConversationAction(conversationUUID: id)
+      case "caps":
+        guard let conversation = manager.conversations.first(where: { $0.uuid == id }) else { throw CocoaError(.validationMissingMandatoryProperty) }
+        manager.reportConversationEvent(.conversationUpdated(.init(capabilities: selectedCapabilities(value["capabilities"] as? [String] ?? []))), for: conversation)
       case "snapshot": break
       default: throw CocoaError(.validationMissingMandatoryProperty)
       }
